@@ -1,0 +1,760 @@
+#!/usr/bin/env python3
+"""
+osu! progress dashboard.
+
+Combines profile stats (osu! API v2) with unstable rate computed locally
+from your .osr replay files (circlecore), in one styled report.
+
+Config lives at ~/.config/osu-tracker/config.json:
+
+    {
+      "client_id":     "67867",
+      "client_secret": "...",     from osu.ppy.sh/home/account/edit -> OAuth
+      "username":      "Ichikaaa",
+      "api_key":       "...",     from the same page -> Legacy API (for UR)
+      "mode":          "osu",
+      "replay_dir":    ""         blank = autodetect
+    }
+
+Usage:
+    osu-stats                 full dashboard
+    osu-stats --session       add a summary of the last few hours of play
+    osu-stats --history       every recorded snapshot
+    osu-stats --no-ur         skip replay processing (faster)
+    osu-stats --notify        desktop notification as well
+    osu-stats --csv out.csv   export the snapshot log
+"""
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from statistics import mean, median
+
+CONFIG_DIR = Path.home() / ".config" / "osu-tracker"
+CONFIG_PATH = CONFIG_DIR / "config.json"
+LEGACY_UR_CONFIG = CONFIG_DIR / "ur-config.json"
+
+DATA_DIR = Path.home() / ".local" / "share" / "osu-tracker"
+HISTORY_PATH = DATA_DIR / "history.jsonl"
+UR_LOG = DATA_DIR / "ur-log.jsonl"          # local .osr files
+SCORE_UR_LOG = DATA_DIR / "score-ur.jsonl"  # replays pulled from the API
+SLIDER_CACHE = DATA_DIR / "beatmaps"
+
+TOKEN_URL = "https://osu.ppy.sh/oauth/token"
+API_BASE = "https://osu.ppy.sh/api/v2"
+
+DEFAULT_REPLAY_DIRS = [
+    Path.home() / ".local" / "share" / "osu" / "exports",
+    Path.home() / ".local" / "share" / "osu-wine" / "osu!" / "Replays",
+]
+
+CONFIG_TEMPLATE = {
+    "client_id": "",
+    "client_secret": "",
+    "username": "",
+    "api_key": "",
+    "redirect_uri": "http://localhost:727/",
+    "mode": "osu",
+    "replay_dir": "",
+}
+
+W = 62  # dashboard width
+
+
+# ---------------------------------------------------------------- styling --
+
+class C:
+    """ANSI colours, disabled when not writing to a terminal."""
+    enabled = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+
+    RESET = "\033[0m"
+    DIM = "\033[2m"
+    BOLD = "\033[1m"
+    PINK = "\033[38;5;212m"
+    BLUE = "\033[38;5;117m"
+    GREEN = "\033[38;5;114m"
+    RED = "\033[38;5;203m"
+    YELLOW = "\033[38;5;222m"
+    GREY = "\033[38;5;245m"
+    PURPLE = "\033[38;5;141m"
+
+    @classmethod
+    def p(cls, text, *codes):
+        if not cls.enabled:
+            return text
+        return "".join(codes) + text + cls.RESET
+
+
+def visible_len(s):
+    """Length of a string ignoring ANSI escape sequences."""
+    out, i = 0, 0
+    while i < len(s):
+        if s[i] == "\033":
+            while i < len(s) and s[i] != "m":
+                i += 1
+            i += 1
+        else:
+            out += 1
+            i += 1
+    return out
+
+
+def rule(title="", char="─"):
+    if not title:
+        return C.p(char * W, C.GREY)
+    left = char * 2
+    pad = char * max(0, W - visible_len(title) - 5)
+    return C.p(left, C.GREY) + " " + C.p(title, C.BOLD, C.PINK) + " " + C.p(pad, C.GREY)
+
+
+def row(label, value, delta="", label_w=15):
+    line = "  " + C.p(f"{label:<{label_w}}", C.GREY) + value
+    if delta:
+        line += "  " + delta
+    return line
+
+
+SPARKS = "▁▂▃▄▅▆▇█"
+
+
+def sparkline(values, invert=False):
+    """Unicode sparkline. invert=True means lower is better (rank, UR)."""
+    vals = [v for v in values if v is not None]
+    if len(vals) < 2:
+        return ""
+    lo, hi = min(vals), max(vals)
+    if hi == lo:
+        return SPARKS[3] * len(vals)
+    out = []
+    for v in vals:
+        frac = (v - lo) / (hi - lo)
+        if invert:
+            frac = 1 - frac
+        out.append(SPARKS[min(len(SPARKS) - 1, int(frac * (len(SPARKS) - 1) + 0.5))])
+    return "".join(out)
+
+
+def bar(frac, width=24, fill="█", empty="░"):
+    frac = max(0.0, min(1.0, frac))
+    n = int(round(frac * width))
+    return fill * n + empty * (width - n)
+
+
+# ----------------------------------------------------------------- config --
+
+def load_config():
+    if not CONFIG_PATH.exists():
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        CONFIG_PATH.write_text(json.dumps(CONFIG_TEMPLATE, indent=2) + "\n")
+        CONFIG_PATH.chmod(0o600)
+        sys.exit(
+            f"Created {CONFIG_PATH}\n"
+            "Fill in client_id, client_secret, username (and api_key for UR),\n"
+            "then run again. Both are at https://osu.ppy.sh/home/account/edit"
+        )
+
+    cfg = json.loads(CONFIG_PATH.read_text())
+
+    # migrate a legacy api key from the older separate file
+    if not cfg.get("api_key") and LEGACY_UR_CONFIG.exists():
+        try:
+            old = json.loads(LEGACY_UR_CONFIG.read_text())
+            if old.get("api_key"):
+                cfg["api_key"] = old["api_key"]
+                cfg.setdefault("replay_dir", old.get("replay_dir", ""))
+                CONFIG_PATH.write_text(json.dumps(cfg, indent=2) + "\n")
+        except Exception:
+            pass
+
+    missing = [k for k in ("client_id", "client_secret", "username") if not cfg.get(k)]
+    if missing:
+        sys.exit(f"{CONFIG_PATH} is missing: {', '.join(missing)}")
+    cfg.setdefault("mode", "osu")
+    return cfg
+
+
+# -------------------------------------------------------------------- api --
+
+def get_token(cfg):
+    payload = json.dumps({
+        "client_id": int(cfg["client_id"]),
+        "client_secret": cfg["client_secret"],
+        "grant_type": "client_credentials",
+        "scope": "public",
+    }).encode()
+    req = urllib.request.Request(
+        TOKEN_URL, data=payload,
+        headers={"Content-Type": "application/json", "Accept": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            return json.load(r)["access_token"]
+    except urllib.error.HTTPError as e:
+        sys.exit(f"Auth failed ({e.code}). Check client_id / client_secret.")
+    except urllib.error.URLError as e:
+        sys.exit(f"Network error: {e.reason}")
+
+
+def api_get(token, path, params=None):
+    url = f"{API_BASE}{path}"
+    if params:
+        url += "?" + urllib.parse.urlencode(params)
+    req = urllib.request.Request(
+        url, headers={"Authorization": f"Bearer {token}", "Accept": "application/json"})
+    with urllib.request.urlopen(req, timeout=20) as r:
+        return json.load(r)
+
+
+def take_snapshot(token, cfg):
+    user = api_get(token, f"/users/{urllib.parse.quote(cfg['username'])}/{cfg['mode']}",
+                   {"key": "username"})
+    st = user.get("statistics") or {}
+    g = st.get("grade_counts") or {}
+    return {
+        "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "user_id": user.get("id"),
+        "username": user.get("username"),
+        "pp": round(st.get("pp") or 0, 2),
+        "global_rank": st.get("global_rank"),
+        "country_rank": st.get("country_rank"),
+        "accuracy": round(st.get("hit_accuracy") or 0, 4),
+        "play_count": st.get("play_count"),
+        "play_time": st.get("play_time"),
+        "total_hits": st.get("total_hits"),
+        "ranked_score": st.get("ranked_score"),
+        "max_combo": st.get("maximum_combo"),
+        "level": (st.get("level") or {}).get("current"),
+        "level_progress": (st.get("level") or {}).get("progress"),
+        "ss": (g.get("ss") or 0) + (g.get("ssh") or 0),
+        "s": (g.get("s") or 0) + (g.get("sh") or 0),
+        "a": g.get("a") or 0,
+    }
+
+
+# ------------------------------------------------------------------ store --
+
+def load_jsonl(path):
+    if not path.exists():
+        return []
+    return [json.loads(l) for l in path.read_text().splitlines() if l.strip()]
+
+
+def append_jsonl(path, entries):
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    with path.open("a") as f:
+        for e in entries:
+            f.write(json.dumps(e) + "\n")
+
+
+# --------------------------------------------------------------------- ur --
+
+def find_replay_dir(cfg, override):
+    if override:
+        d = Path(override).expanduser()
+        return d if d.is_dir() else None
+    if cfg.get("replay_dir"):
+        d = Path(cfg["replay_dir"]).expanduser()
+        if d.is_dir():
+            return d
+    for d in DEFAULT_REPLAY_DIRS:
+        if d.is_dir() and any(d.glob("*.osr")):
+            return d
+    return None
+
+
+def process_replays(cfg, replay_dir, redo_all=False, quiet=False):
+    if not cfg.get("api_key"):
+        return [], "no legacy api_key in config - UR skipped"
+    try:
+        from circleguard import Circleguard, ReplayPath
+    except ImportError:
+        return [], "circleguard not installed (pip install circleguard --break-system-packages)"
+
+    SLIDER_CACHE.mkdir(parents=True, exist_ok=True)
+    cg = Circleguard(cfg["api_key"], slider_dir=str(SLIDER_CACHE))
+
+    seen = set() if redo_all else {e["file"] for e in load_jsonl(UR_LOG)}
+    files = sorted(replay_dir.glob("*.osr"), key=lambda p: p.stat().st_mtime)
+    todo = [f for f in files if f.name not in seen]
+    if not todo:
+        return [], None
+
+    if not quiet:
+        print(C.p(f"  processing {len(todo)} new replay(s)...", C.DIM))
+
+    new = []
+    for path in todo:
+        try:
+            r = ReplayPath(str(path))
+            cg.load(r)
+            new.append({
+                "file": path.name,
+                "played_at": (r.timestamp.isoformat(timespec="seconds")
+                              if getattr(r, "timestamp", None) else
+                              datetime.fromtimestamp(path.stat().st_mtime,
+                                                     timezone.utc).isoformat(timespec="seconds")),
+                "ur": round(cg.ur(r), 2),
+                "mods": str(r.mods) if getattr(r, "mods", None) else "NM",
+                "count_300": getattr(r, "count_300", None),
+                "count_100": getattr(r, "count_100", None),
+                "count_50": getattr(r, "count_50", None),
+                "count_miss": getattr(r, "count_miss", None),
+            })
+        except Exception as e:
+            if not quiet:
+                print(C.p(f"  skipped {path.name[:40]} ({type(e).__name__})", C.DIM))
+
+    if new:
+        append_jsonl(UR_LOG, new)
+    return new, None
+
+
+def _score_key(s):
+    """Stable identifier for a score across API shapes."""
+    bm = s.get("beatmap") or {}
+    return f"{bm.get('id')}_{s.get('id') or s.get('best_id') or ''}"
+
+
+def fetch_score_urs(cfg, scores, label, quiet=False):
+    """
+    Download replays for the given API scores and compute UR for each.
+
+    Tries osu! API v2 first (ossapi.download_score), which is the only
+    route that works for lazer scores. Falls back to the legacy API for
+    older stable scores.
+
+    osu! stores one replay per map per player - your best - so a score
+    that isn't a personal best has no replay and gets skipped.
+    """
+    try:
+        from circleguard import Circleguard, ReplayString, ReplayMap
+        from ossapi import Ossapi
+    except ImportError as e:
+        return [], f"missing dependency: {e.name}"
+
+    SLIDER_CACHE.mkdir(parents=True, exist_ok=True)
+    cg = Circleguard(cfg.get("api_key") or "unused", slider_dir=str(SLIDER_CACHE))
+
+    try:
+        api = Ossapi(
+            int(cfg["client_id"]),
+            cfg["client_secret"],
+            cfg.get("redirect_uri") or "http://localhost:727/",
+            scopes=["public", "identify"],
+            token_directory=str(DATA_DIR),
+        )
+    except Exception as e:
+        return [], (f"API v2 auth failed: {e}\n"
+                    "  Replay download needs the authorization code grant.\n"
+                    "  Set your OAuth app's callback URL to http://localhost:727/\n"
+                    "  at https://osu.ppy.sh/home/account/edit -> OAuth -> Edit")
+
+    cached = {e["key"]: e for e in load_jsonl(SCORE_UR_LOG)}
+    out, fresh = [], []
+
+    todo = [s for s in scores if _score_key(s) not in cached]
+    if todo and not quiet:
+        print(C.p(f"  fetching {len(todo)} {label} replay(s)...", C.DIM))
+
+    for i, s in enumerate(scores):
+        key = _score_key(s)
+        if key in cached:
+            out.append(cached[key])
+            continue
+
+        bm = s.get("beatmap") or {}
+        bms = s.get("beatmapset") or {}
+        stats = s.get("statistics") or {}
+        score_id = s.get("id") or s.get("best_id")
+        name = bms.get("title", "?")[:34]
+
+        replay = None
+        err = None
+
+        # --- API v2 (works for lazer scores) ---
+        if score_id:
+            try:
+                raw = api.download_score(int(score_id), raw=True)
+                data = raw if isinstance(raw, (bytes, bytearray)) else getattr(raw, "raw", None)
+                if data:
+                    replay = ReplayString(bytes(data))
+            except Exception as e:
+                err = f"v2 {type(e).__name__}"
+
+        # --- legacy fallback (stable scores only) ---
+        if replay is None and cfg.get("api_key"):
+            try:
+                replay = ReplayMap(bm.get("id"), s.get("user_id"))
+            except Exception as e:
+                err = f"{err or ''} legacy {type(e).__name__}".strip()
+
+        if replay is None:
+            if not quiet:
+                print(C.p(f"  skipped {name} ({err})", C.DIM))
+            continue
+
+        try:
+            cg.load(replay)
+            entry = {
+                "key": key,
+                "beatmap_id": bm.get("id"),
+                "title": bms.get("title", "?"),
+                "version": bm.get("version", ""),
+                "stars": bm.get("difficulty_rating"),
+                "accuracy": round((s.get("accuracy") or 0) * 100, 2),
+                "pp": round(s.get("pp") or 0, 1),
+                "mods": "".join(m.get("acronym", "") for m in (s.get("mods") or [])) or "NM",
+                "played_at": (s.get("ended_at") or s.get("created_at") or "")[:19],
+                "ur": round(cg.ur(replay), 2),
+                "count_miss": stats.get("miss") or stats.get("count_miss") or 0,
+            }
+            out.append(entry)
+            fresh.append(entry)
+        except Exception as e:
+            if not quiet:
+                print(C.p(f"  skipped {name} (ur: {type(e).__name__})", C.DIM))
+
+        if i < len(scores) - 1:
+            time.sleep(0.5)
+
+    if fresh:
+        append_jsonl(SCORE_UR_LOG, fresh)
+    return out, None
+
+
+def render_score_urs(rows, title):
+    if not rows:
+        return []
+    out = ["", rule(title), ""]
+    urs = [r["ur"] for r in rows if r.get("ur")]
+    if len(urs) >= 2:
+        out.append(row("best UR", C.p(f"{min(urs):>8.1f}", C.GREEN)))
+        out.append(row("median UR", f"{median(urs):>8.1f}"))
+        out.append("")
+
+    hdr = f"  {'UR':>7}{'acc':>9}{'pp':>7}{'★':>7}  map"
+    out.append(C.p(hdr, C.DIM))
+    for r in sorted(rows, key=lambda x: -(x.get("pp") or 0)):
+        u = r.get("ur")
+        colour = C.GREEN if u < 200 else C.YELLOW if u < 320 else C.RED
+        name = f"{r['title'][:28]}"
+        diff = f" [{r['version'][:12]}]" if r.get("version") else ""
+        out.append(
+            C.p(f"  {u:>7.1f}", colour)
+            + f"{r['accuracy']:>8.2f}%"
+            + C.p(f"{r['pp']:>7.0f}", C.PINK)
+            + f"{r.get('stars') or 0:>6.2f}★"
+            + f"  {name}" + C.p(diff, C.DIM)
+            + C.p(f" +{r['mods']}" if r['mods'] != "NM" else "", C.YELLOW)
+        )
+    return out
+
+
+# --------------------------------------------------------------- rendering --
+
+def fmt_time(iso, date=True):
+    """UTC ISO string -> local 12-hour time."""
+    if not iso:
+        return ""
+    try:
+        dt = datetime.fromisoformat(str(iso).replace("Z", "+00:00"))
+    except ValueError:
+        return str(iso)[:16]
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    local = dt.astimezone()
+    t = local.strftime("%I:%M %p").lstrip("0")
+    return f"{local.strftime('%d %b')}  {t}" if date else t
+
+
+def fmt_playtime(seconds):
+    if not seconds:
+        return "0h"
+    d, rem = divmod(int(seconds), 86400)
+    h, rem = divmod(rem, 3600)
+    m = rem // 60
+    return f"{d}d {h}h {m}m" if d else f"{h}h {m}m"
+
+
+def delta(new, old, decimals=0, invert=False, suffix=""):
+    if new is None or old is None:
+        return ""
+    diff = new - old
+    if abs(diff) < 10 ** -(decimals + 2):
+        return C.p("·", C.DIM)
+    good = (diff < 0) if invert else (diff > 0)
+    arrow = "▲" if good else "▼"
+    colour = C.GREEN if good else C.RED
+    shown = f"{abs(diff):,.{decimals}f}" if decimals else f"{int(abs(diff)):,}"
+    return C.p(f"{arrow} {shown}{suffix}", colour)
+
+
+def render_profile(snap, prev, history):
+    out = []
+    name = snap.get("username") or "osu!"
+
+    out.append("")
+    out.append(rule(f"{name}", "━"))
+    out.append(C.p(f"  {fmt_time(snap['timestamp'])}", C.DIM))
+    out.append("")
+
+    pp_hist = [h["pp"] for h in history[-20:]] + [snap["pp"]]
+    rank_hist = [h["global_rank"] for h in history[-20:]] + [snap["global_rank"]]
+
+    out.append(row("pp", C.p(f"{snap['pp']:>8,.0f}", C.BOLD, C.PINK),
+                   delta(snap["pp"], prev and prev["pp"])))
+    if len(pp_hist) >= 4:
+        out.append(row("", C.p(sparkline(pp_hist), C.PINK)
+                       + C.p(f"  last {len(pp_hist)} checks", C.DIM)))
+
+    out.append(row("global", C.p(f"{'#' + format(snap['global_rank'], ',') if snap['global_rank'] else '-':>8}", C.BLUE),
+                   delta(snap["global_rank"], prev and prev["global_rank"], invert=True)))
+    if len([r for r in rank_hist if r]) >= 4:
+        out.append(row("", C.p(sparkline(rank_hist, invert=True), C.BLUE)
+                       + C.p("  rising = climbing", C.DIM)))
+
+    out.append(row("country", C.p(f"{'#' + format(snap['country_rank'], ',') if snap['country_rank'] else '-':>8}", C.BLUE),
+                   delta(snap["country_rank"], prev and prev["country_rank"], invert=True)))
+    out.append("")
+    out.append(row("accuracy", f"{snap['accuracy']:>7.2f}%",
+                   delta(snap["accuracy"], prev and prev["accuracy"], 2, suffix="%")))
+    out.append(row("plays", f"{snap['play_count']:>8,}",
+                   delta(snap["play_count"], prev and prev["play_count"])))
+    out.append(row("playtime", f"{fmt_playtime(snap['play_time']):>8}"))
+    if snap.get("level"):
+        prog = (snap.get("level_progress") or 0) / 100
+        out.append(row("level", f"{snap['level']:>8}  " +
+                       C.p(bar(prog, 20), C.PURPLE) + C.p(f" {snap.get('level_progress', 0)}%", C.DIM)))
+    out.append("")
+
+    grades = (
+        C.p(f"SS {snap['ss']}", C.YELLOW) + "   " +
+        C.p(f"S {snap['s']}", C.BLUE) + "   " +
+        C.p(f"A {snap['a']}", C.GREEN)
+    )
+    out.append(row("grades", grades))
+
+    if prev and snap.get("play_time") and prev.get("play_time"):
+        mins = (snap["play_time"] - prev["play_time"]) // 60
+        if mins:
+            out.append(row("since last", C.p(f"{mins} min played", C.DIM)))
+    return out
+
+
+def render_ur(ur_rows, limit=8):
+    if not ur_rows:
+        return []
+    rows = sorted(ur_rows, key=lambda r: r["played_at"])
+    urs = [r["ur"] for r in rows]
+
+    out = ["", rule("unstable rate")]
+    out.append("")
+    best = min(urs)
+    out.append(row("best", C.p(f"{best:>8.1f}", C.GREEN)))
+    out.append(row("median", f"{median(urs):>8.1f}"))
+    if len(urs) >= 6:
+        first, last = mean(urs[:3]), mean(urs[-3:])
+        d = last - first
+        tag = C.p(f"▲ {abs(d):.1f} better", C.GREEN) if d < 0 else C.p(f"▼ {abs(d):.1f} worse", C.RED)
+        out.append(row("recent 3", f"{last:>8.1f}", tag))
+    if len(urs) > 2:
+        out.append(row("", C.p(sparkline(urs, invert=True), C.GREEN)))
+
+    out.append("")
+    hdr = f"  {'played':<17}{'UR':>7}  {'300':>4}{'100':>5}{'50':>4}{'miss':>5}  mods"
+    out.append(C.p(hdr, C.DIM))
+    for r in rows[-limit:]:
+        u = r["ur"]
+        colour = C.GREEN if u < 200 else C.YELLOW if u < 320 else C.RED
+        miss = r.get("count_miss") or 0
+        out.append(
+            f"  {fmt_time(r['played_at']):<17}"
+            + C.p(f"{u:>7.1f}", colour)
+            + f"  {r.get('count_300') or 0:>4}{r.get('count_100') or 0:>5}"
+              f"{r.get('count_50') or 0:>4}"
+            + (C.p(f"{miss:>5}", C.RED) if miss else f"{miss:>5}")
+            + "  " + C.p(r.get("mods", ""), C.DIM)
+        )
+    return out
+
+
+def render_session(token, snap, hours):
+    try:
+        scores = api_get(token, f"/users/{snap['user_id']}/scores/recent",
+                         {"limit": 50, "include_fails": 1, "mode": "osu"})
+    except urllib.error.HTTPError:
+        return []
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
+    recent = []
+    for s in scores:
+        ts = s.get("ended_at") or s.get("created_at")
+        if not ts:
+            continue
+        if datetime.fromisoformat(ts.replace("Z", "+00:00")) >= cutoff:
+            recent.append(s)
+    if not recent:
+        return ["", rule(f"last {hours}h"), "", C.p("  no scores submitted", C.DIM)]
+
+    accs = [s["accuracy"] * 100 for s in recent]
+    stars = [(s.get("beatmap") or {}).get("difficulty_rating")
+             for s in recent if (s.get("beatmap") or {}).get("difficulty_rating")]
+    passed = sum(1 for s in recent if s.get("passed"))
+    best = max(recent, key=lambda s: s["accuracy"])
+    title = (best.get("beatmapset") or {}).get("title", "?")
+
+    out = ["", rule(f"last {hours}h"), ""]
+    out.append(row("scores", f"{len(recent):>8}"))
+    out.append(row("avg acc", f"{mean(accs):>7.2f}%"))
+    if stars:
+        out.append(row("avg stars", f"{mean(stars):>7.2f}★" +
+                       C.p(f"   max {max(stars):.2f}★", C.DIM)))
+    pass_frac = passed / len(recent)
+    out.append(row("passed", f"{passed:>4}/{len(recent):<4}" + C.p(bar(pass_frac, 16), C.GREEN)))
+    out.append(row("best", C.p(f"{best['accuracy'] * 100:.2f}%", C.GREEN) +
+                   C.p(f"  {title[:32]}", C.DIM)))
+    return out
+
+
+def notify(snap, prev):
+    parts = [f"{snap['pp']:,.0f}pp"]
+    if prev:
+        d = snap["pp"] - prev["pp"]
+        if abs(d) >= 1:
+            parts.append(f"{'+' if d > 0 else ''}{d:,.0f}")
+    if snap["global_rank"]:
+        parts.append(f"#{snap['global_rank']:,}")
+    try:
+        subprocess.run(["notify-send", "-a", "osu-stats", "osu! progress",
+                        "  ".join(parts)], check=False, timeout=5)
+    except FileNotFoundError:
+        pass
+
+
+# ------------------------------------------------------------------- main --
+
+def main():
+    ap = argparse.ArgumentParser(description="osu! progress dashboard")
+    ap.add_argument("--session", action="store_true", help="summarise recent play")
+    ap.add_argument("--hours", type=int, default=6, help="window for --session")
+    ap.add_argument("--top", nargs="?", type=int, const=10, default=None,
+                    metavar="N", help="UR for your all-time top N plays (default 10)")
+    ap.add_argument("--session-top", nargs="?", type=int, const=3, default=None,
+                    metavar="N", help="UR for the best N plays this session (default 3)")
+    ap.add_argument("--quick", action="store_true",
+                    help="profile + local replays only; skip the API replay fetches")
+    ap.add_argument("--history", action="store_true", help="print all snapshots")
+    ap.add_argument("--no-ur", action="store_true", help="skip replay processing")
+    ap.add_argument("--redo-ur", action="store_true", help="reprocess all replays")
+    ap.add_argument("--dir", help="replay folder override")
+    ap.add_argument("--notify", action="store_true", help="desktop notification")
+    ap.add_argument("--no-save", action="store_true", help="don't append to history")
+    ap.add_argument("--no-color", action="store_true", help="plain output")
+    ap.add_argument("--csv", help="export snapshot history to CSV")
+    ap.add_argument("--limit", type=int, default=8, help="UR rows to show")
+    args = ap.parse_args()
+
+    if args.no_color:
+        C.enabled = False
+
+    # a bare run gives the full picture: all-time top 10 + best 3 this session
+    if not args.quick and args.top is None and args.session_top is None \
+            and not args.history and not args.csv:
+        args.top = 10
+        args.session_top = 3
+
+    if args.history:
+        rows = load_jsonl(HISTORY_PATH)
+        if not rows:
+            sys.exit("No history yet.")
+        print()
+        print(C.p(f"  {'date':<17}{'pp':>8}{'rank':>12}{'acc':>9}{'plays':>9}", C.DIM))
+        for r in rows:
+            rank = f"#{r['global_rank']:,}" if r.get("global_rank") else "-"
+            print(f"  {fmt_time(r['timestamp']):<17}"
+                  + C.p(f"{r['pp']:>8,.0f}", C.PINK)
+                  + f"{rank:>12}{r['accuracy']:>8.2f}%{r['play_count']:>9,}")
+        print()
+        return
+
+    if args.csv:
+        import csv
+        rows = load_jsonl(HISTORY_PATH)
+        if not rows:
+            sys.exit("Nothing logged yet.")
+        with open(args.csv, "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+            w.writeheader()
+            w.writerows(rows)
+        print(f"Wrote {len(rows)} rows to {args.csv}")
+        return
+
+    cfg = load_config()
+    token = get_token(cfg)
+    snap = take_snapshot(token, cfg)
+
+    history = load_jsonl(HISTORY_PATH)
+    prev = history[-1] if history else None
+
+    lines = render_profile(snap, prev, history)
+
+    if not args.no_ur:
+        replay_dir = find_replay_dir(cfg, args.dir)
+        if replay_dir:
+            _, err = process_replays(cfg, replay_dir, args.redo_ur, quiet=True)
+            if err:
+                lines += ["", C.p(f"  {err}", C.DIM)]
+        ur_rows = load_jsonl(UR_LOG)
+        lines += render_ur(ur_rows, args.limit)
+
+    if args.session:
+        lines += render_session(token, snap, args.hours)
+
+    if args.top:
+        print("\n".join(lines)); lines = []
+        best = api_get(token, f"/users/{snap['user_id']}/scores/best",
+                       {"limit": args.top, "mode": cfg["mode"]})
+        rows, err = fetch_score_urs(cfg, best, "top play")
+        lines += ([C.p(f"  {err}", C.DIM)] if err
+                  else render_score_urs(rows, f"top {args.top} plays"))
+
+    if args.session_top:
+        print("\n".join(lines)); lines = []
+        recent = api_get(token, f"/users/{snap['user_id']}/scores/recent",
+                         {"limit": 50, "include_fails": 0, "mode": cfg["mode"]})
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=args.hours)
+        window = []
+        for s in recent:
+            ts = s.get("ended_at") or s.get("created_at")
+            if ts and datetime.fromisoformat(ts.replace("Z", "+00:00")) >= cutoff:
+                window.append(s)
+        window.sort(key=lambda s: -(s.get("accuracy") or 0))
+        picked = window[:args.session_top]
+        if picked:
+            rows, err = fetch_score_urs(cfg, picked, "session")
+            lines += ([C.p(f"  {err}", C.DIM)] if err
+                      else render_score_urs(rows, f"best {len(picked)} this session"))
+        else:
+            lines += ["", rule(f"best this session"), "",
+                      C.p(f"  no passed scores in the last {args.hours}h", C.DIM)]
+
+    lines.append("")
+    lines.append(rule("", "━"))
+    lines.append("")
+    print("\n".join(lines))
+
+    if args.notify:
+        notify(snap, prev)
+    if not args.no_save:
+        append_jsonl(HISTORY_PATH, [snap])
+
+
+if __name__ == "__main__":
+    main()

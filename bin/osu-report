@@ -1,0 +1,2512 @@
+#!/usr/bin/env python3
+"""
+osu! session report — a visual dashboard rendered to a self-contained HTML file.
+
+Companion to `osu-stats`. Where osu-stats prints a terminal summary, this builds
+a full page: top plays, progress curves, and consistency analysis, then opens it.
+
+    osu-report                     full report for the last 6h, opens in a browser
+    osu-report --term              draw it in the terminal instead — no browser
+    osu-report --sixel             the HTML report rasterised inline (needs sixel)
+    osu-report --hours 3           narrow the session window
+    osu-report --session-top 10    best N plays inside the window   (default 10)
+    osu-report --top 10            all-time best N                  (default 10)
+    osu-report --fast              skip replay downloads; use cached UR only
+    osu-report --offline           no API at all; render from local logs
+    osu-report --no-open           write the file, don't launch a browser
+    osu-report --out PATH          explicit output path
+
+--term renders with truecolour and braille line charts; it needs a terminal that
+supports 24-bit colour (foot, kitty, alacritty). --sixel needs one with sixel
+graphics (foot, xterm -ti vt340, wezterm) plus chafa and firefox.
+
+API access, credentials and UR computation are reused from osu-stats, so there
+is one implementation of each. Only the presentation lives here.
+"""
+
+import argparse
+import base64
+import hashlib
+import html
+import importlib.machinery
+import importlib.util
+import json
+import math
+import os
+import random
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import unicodedata
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from statistics import mean, median
+
+STATS_PATH = Path.home() / ".local" / "bin" / "osu-stats"
+DATA_DIR = Path.home() / ".local" / "share" / "osu-tracker"
+REPORT_DIR = DATA_DIR / "reports"
+FONT_PATH = DATA_DIR / "fonts" / "rubik.woff2"
+
+# HTML reports are bulky and disposable — the durable record is the jsonl logs
+# plus the Markdown digests, which are tiny.
+KEEP_REPORTS = 5
+KEEP_BRIEFS = 40
+EMBED_FONT = False
+
+# osu!'s hue palette, as used by lazer and osu-web.
+OSU = {
+    "pink": "#ff66ab", "pink_dark": "#cc5288", "pink_light": "#ff99cc",
+    "purple": "#8866ee", "purple_dark": "#6644cc", "purple_light": "#aa88ff",
+    "blue": "#66ccff", "blue_dark": "#4488cc",
+    "yellow": "#ffcc22", "yellow_dark": "#eeaa00",
+    "green": "#b3d944", "green_dark": "#88b300",
+    "red": "#ff6666", "red_dark": "#ed1121",
+}
+
+
+def load_stats_module():
+    """Import ~/.local/bin/osu-stats, which has no .py extension."""
+    if not STATS_PATH.exists():
+        sys.exit(f"osu-stats not found at {STATS_PATH}")
+    loader = importlib.machinery.SourceFileLoader("osustats", str(STATS_PATH))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    mod.C.enabled = False          # never emit ANSI into our stdout
+    return mod
+
+
+ost = load_stats_module()
+
+
+# ------------------------------------------------------------------- theme --
+
+def font_face():
+    """
+    Embed Rubik as the stand-in for lazer's Torus, which isn't redistributable.
+
+    Off by default: Rubik is installed system-wide here and the CSS stack falls
+    through to it, so inlining 150 KB into every report would trade 60% of each
+    file's size for nothing. --embed-font turns it on for a report you intend to
+    send somewhere else.
+    """
+    if not EMBED_FONT or not FONT_PATH.exists():
+        return ""
+    try:
+        b64 = base64.b64encode(FONT_PATH.read_bytes()).decode()
+    except OSError:
+        return ""
+    return (f"@font-face{{font-family:'Torus Sub';src:url(data:font/woff2;base64,{b64})"
+            f" format('woff2-variations');font-weight:300 900;font-display:swap}}")
+
+
+def triangles(w=520, h=420, n=30, color="#ffffff", lo=0.02, hi=0.075, seed=4,
+              smin=0.06, smax=0.30):
+    """
+    lazer's signature background motif, as a tiling data URI.
+
+    Equilateral triangles, upright, scattered at varying size and opacity —
+    the static equivalent of the field that drifts upward in the client.
+    Keep the opacity low on the page backdrop: it should read as texture, not
+    as content competing with the numbers on top of it.
+    """
+    rnd = random.Random(seed)
+    shapes = []
+    for _ in range(n):
+        size = rnd.uniform(w * smin, w * smax)
+        cx, cy = rnd.uniform(0, w), rnd.uniform(0, h)
+        half, height = size / 2, size * 0.866
+        pts = f"{cx:.1f},{cy - height * 2 / 3:.1f} " \
+              f"{cx - half:.1f},{cy + height / 3:.1f} " \
+              f"{cx + half:.1f},{cy + height / 3:.1f}"
+        shapes.append(f"<polygon points='{pts}' fill='{color}' fill-opacity='{rnd.uniform(lo, hi):.3f}'/>")
+    svg = (f"<svg xmlns='http://www.w3.org/2000/svg' width='{w}' height='{h}' "
+           f"viewBox='0 0 {w} {h}'>{''.join(shapes)}</svg>")
+    return "data:image/svg+xml;base64," + base64.b64encode(svg.encode()).decode()
+
+
+# lazer groups mods by category and colours them accordingly.
+MOD_CATEGORY = {
+    "EZ": "reduction", "NF": "reduction", "HT": "reduction", "DC": "reduction",
+    "HR": "increase", "SD": "increase", "PF": "increase", "DT": "increase",
+    "NC": "increase", "HD": "increase", "FL": "increase", "AC": "increase",
+    "BL": "increase", "SG": "increase",
+    "RX": "automation", "AP": "automation", "SO": "automation", "CN": "automation",
+    "TP": "automation",
+}
+
+
+def mod_class(acronym):
+    return "mod-" + MOD_CATEGORY.get(acronym.upper(), "fun")
+
+
+# ------------------------------------------------------------------ helpers --
+
+def parse_iso(s):
+    if not s:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(s).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+def local(dt):
+    return dt.astimezone() if dt else None
+
+
+def fmt_when(dt):
+    dt = local(dt)
+    return dt.strftime("%d %b, %I:%M %p").lstrip("0").replace(" 0", " ") if dt else ""
+
+
+def fmt_ago(dt):
+    if not dt:
+        return ""
+    secs = (datetime.now(timezone.utc) - dt).total_seconds()
+    if secs < 90:
+        return "just now"
+    for size, name in ((3600, "m"), (86400, "h"), (604800, "d")):
+        if secs < size:
+            unit = size // 60 if name == "m" else (3600 if name == "h" else 86400)
+            return f"{int(secs // unit)}{name} ago"
+    return f"{int(secs // 604800)}w ago"
+
+
+def fmt_dur(seconds):
+    if not seconds:
+        return "0m"
+    d, rem = divmod(int(seconds), 86400)
+    h, rem = divmod(rem, 3600)
+    m = rem // 60
+    if d:
+        return f"{d}d {h}h"
+    return f"{h}h {m}m" if h else f"{m}m"
+
+
+def esc(s):
+    return html.escape(str(s if s is not None else ""))
+
+
+def pct_rank(values, v):
+    """Fraction of `values` that v is better than (lower is better)."""
+    if not values:
+        return 0.5
+    return sum(1 for x in values if x > v) / len(values)
+
+
+def percentile(values, q):
+    if not values:
+        return None
+    s = sorted(values)
+    i = (len(s) - 1) * q
+    lo, hi = math.floor(i), math.ceil(i)
+    return s[lo] if lo == hi else s[lo] + (s[hi] - s[lo]) * (i - lo)
+
+
+def lerp_hex(a, b, t):
+    a, b = a.lstrip("#"), b.lstrip("#")
+    out = []
+    for i in (0, 2, 4):
+        ca, cb = int(a[i:i + 2], 16), int(b[i:i + 2], 16)
+        out.append(f"{int(round(ca + (cb - ca) * t)):02x}")
+    return "#" + "".join(out)
+
+
+# osu!'s difficulty spectrum, sampled at its published stops.
+STAR_STOPS = [
+    (0.1, "#4290fb"), (1.25, "#4fc0ff"), (2.0, "#4fffd5"), (2.5, "#7cff4f"),
+    (3.3, "#f6f05c"), (4.2, "#ff8068"), (4.9, "#ff4e6f"), (5.8, "#c645b8"),
+    (6.7, "#6563de"), (7.7, "#18158e"), (9.0, "#000000"),
+]
+
+
+def star_color(sr):
+    sr = float(sr or 0)
+    if sr <= STAR_STOPS[0][0]:
+        return STAR_STOPS[0][1]
+    for (s0, c0), (s1, c1) in zip(STAR_STOPS, STAR_STOPS[1:]):
+        if sr <= s1:
+            return lerp_hex(c0, c1, (sr - s0) / (s1 - s0))
+    return STAR_STOPS[-1][1]
+
+
+def readable_on(hex_color):
+    """Black or white text, whichever contrasts better with the pill colour."""
+    c = hex_color.lstrip("#")
+    r, g, b = (int(c[i:i + 2], 16) / 255 for i in (0, 2, 4))
+    lum = 0.2126 * r + 0.7152 * g + 0.0722 * b
+    return "#0b0b12" if lum > 0.45 else "#ffffff"
+
+
+GRADE_COLORS = {
+    "XH": "#e8eef5", "X": "#ffd966", "SH": "#e8eef5", "S": "#ffd966",
+    "A": "#b3d944", "B": "#66ccff", "C": "#aa88ff", "D": "#ff6666", "F": "#8b7f92",
+}
+
+GRADE_LABELS = {"XH": "SS", "X": "SS", "SH": "S", "S": "S", "F": "F"}
+
+
+def grade_of(score):
+    """Prefer the API's own grade; fall back to accuracy when absent."""
+    r = score.get("rank")
+    if isinstance(r, str) and r:
+        return r.upper()
+    acc = (score.get("accuracy") or 0) * 100
+    for cut, g in ((100, "X"), (95, "S"), (90, "A"), (80, "B"), (70, "C")):
+        if acc >= cut:
+            return g
+    return "D"
+
+
+def mods_of(score):
+    mods = score.get("mods") or []
+    out = []
+    for m in mods:
+        acr = m.get("acronym") if isinstance(m, dict) else str(m)
+        if acr and acr not in ("CL",):      # classic mod is noise on lazer scores
+            out.append(acr)
+    return out
+
+
+# ------------------------------------------------------------------- charts --
+
+def nice_ticks(lo, hi, n=4):
+    if hi <= lo:
+        pad = abs(lo) * 0.05 or 1.0
+        return [lo], lo - pad, hi + pad
+    raw = (hi - lo) / n
+    mag = 10 ** math.floor(math.log10(raw))
+    step = mag * 10
+    for m in (1, 2, 2.5, 5, 10):
+        if raw <= m * mag:
+            step = m * mag
+            break
+    start = math.floor(lo / step) * step
+    end = math.ceil(hi / step) * step
+    ticks, v = [], start
+    while v <= end + step * 1e-9:
+        ticks.append(round(v, 10))
+        v += step
+    return ticks, start, end
+
+
+def svg_timeseries(points, color, yfmt, invert=False, w=520, h=190, area=True):
+    """points: [(datetime, value)] -> an SVG string, or an empty-state div."""
+    points = [(t, v) for t, v in points if t is not None and v is not None]
+    if len(points) < 2:
+        return "<div class='empty'>not enough data yet</div>"
+    points.sort(key=lambda p: p[0])
+
+    pad_l, pad_r, pad_t, pad_b = 54, 14, 14, 26
+    pw, ph = w - pad_l - pad_r, h - pad_t - pad_b
+    vals = [v for _, v in points]
+    ticks, ymin, ymax = nice_ticks(min(vals), max(vals))
+    t0, t1 = points[0][0], points[-1][0]
+    span = (t1 - t0).total_seconds() or 1
+
+    def X(t):
+        return pad_l + (t - t0).total_seconds() / span * pw
+
+    def Y(v):
+        f = (v - ymin) / (ymax - ymin or 1)
+        if invert:
+            f = 1 - f
+        return pad_t + (1 - f) * ph
+
+    uid = f"g{abs(hash((color, w, len(points), vals[0]))) % 100000}"
+    parts = [f"<svg viewBox='0 0 {w} {h}' class='chart' role='img'>"]
+    parts.append(
+        f"<defs><linearGradient id='{uid}' x1='0' y1='0' x2='0' y2='1'>"
+        f"<stop offset='0%' stop-color='{color}' stop-opacity='.32'/>"
+        f"<stop offset='100%' stop-color='{color}' stop-opacity='0'/>"
+        f"</linearGradient></defs>"
+    )
+
+    for tv in ticks:
+        y = Y(tv)
+        if not (pad_t - 1 <= y <= pad_t + ph + 1):
+            continue
+        parts.append(f"<line x1='{pad_l}' y1='{y:.1f}' x2='{w - pad_r}' y2='{y:.1f}' class='grid'/>")
+        parts.append(f"<text x='{pad_l - 8}' y='{y + 3.5:.1f}' class='axis' text-anchor='end'>{esc(yfmt(tv))}</text>")
+
+    line = " ".join(f"{X(t):.1f},{Y(v):.1f}" for t, v in points)
+    if area:
+        floor = pad_t + ph
+        parts.append(f"<polygon points='{pad_l:.1f},{floor} {line} {w - pad_r:.1f},{floor}' fill='url(#{uid})'/>")
+    parts.append(f"<polyline points='{line}' fill='none' stroke='{color}' stroke-width='2' "
+                 f"stroke-linejoin='round' stroke-linecap='round'/>")
+
+    for t, v in points:
+        parts.append(f"<circle class='pt' cx='{X(t):.1f}' cy='{Y(v):.1f}' r='3' fill='{color}' "
+                     f"data-tip='{esc(yfmt(v) + chr(10) + fmt_when(t))}'/>")
+
+    for t, anchor in ((t0, "start"), (t1, "end")):
+        parts.append(f"<text x='{X(t):.1f}' y='{h - 8}' class='axis' text-anchor='{anchor}'>"
+                     f"{esc(local(t).strftime('%d %b'))}</text>")
+    parts.append("</svg>")
+    return "".join(parts)
+
+
+def svg_scatter_trend(rows, w=520, h=280):
+    """UR against time, with a least-squares trend line."""
+    pts = [(parse_iso(r.get("played_at")), r.get("ur")) for r in rows]
+    pts = [(t, v) for t, v in pts if t and v]
+    if len(pts) < 3:
+        return "<div class='empty'>not enough replays yet</div>"
+    pts.sort(key=lambda p: p[0])
+
+    pad_l, pad_r, pad_t, pad_b = 54, 14, 14, 26
+    pw, ph = w - pad_l - pad_r, h - pad_t - pad_b
+    vals = [v for _, v in pts]
+    ticks, ymin, ymax = nice_ticks(min(vals), max(vals))
+    t0, t1 = pts[0][0], pts[-1][0]
+    span = (t1 - t0).total_seconds() or 1
+
+    def X(t):
+        return pad_l + (t - t0).total_seconds() / span * pw
+
+    def Y(v):
+        return pad_t + (1 - (v - ymin) / (ymax - ymin or 1)) * ph
+
+    parts = [f"<svg viewBox='0 0 {w} {h}' class='chart' role='img' data-cross='1'>"]
+    parts.append(f"<line class='crosshair' x1='0' y1='{pad_t}' x2='0' y2='{pad_t + ph}'/>")
+    parts.append(f"<rect x='{pad_l}' y='{pad_t}' width='{pw}' height='{ph}' "
+                 f"fill='none' pointer-events='all'/>")
+    for tv in ticks:
+        y = Y(tv)
+        if not (pad_t - 1 <= y <= pad_t + ph + 1):
+            continue
+        parts.append(f"<line x1='{pad_l}' y1='{y:.1f}' x2='{w - pad_r}' y2='{y:.1f}' class='grid'/>")
+        parts.append(f"<text x='{pad_l - 8}' y='{y + 3.5:.1f}' class='axis' text-anchor='end'>{tv:.0f}</text>")
+
+    xs = [(t - t0).total_seconds() for t, _ in pts]
+    mx, my = mean(xs), mean(vals)
+    denom = sum((x - mx) ** 2 for x in xs)
+    if denom:
+        slope = sum((x - mx) * (y - my) for x, y in zip(xs, vals)) / denom
+        y_a, y_b = my + slope * (xs[0] - mx), my + slope * (xs[-1] - mx)
+        y_a, y_b = max(ymin, min(ymax, y_a)), max(ymin, min(ymax, y_b))
+        parts.append(f"<line x1='{pad_l}' y1='{Y(y_a):.1f}' x2='{w - pad_r}' y2='{Y(y_b):.1f}' "
+                     f"class='trend'/>")
+
+    for (t, v), r in zip(pts, sorted([r for r in rows if parse_iso(r.get('played_at')) and r.get('ur')],
+                                     key=lambda r: parse_iso(r['played_at']))):
+        c = star_color(r.get("stars"))
+        tip = (f"{r.get('title', '')[:46]}\n"
+               f"UR {v:.0f} · {r.get('stars') or 0:.2f}★\n"
+               f"{fmt_when(t)}")
+        parts.append(f"<circle class='pt' cx='{X(t):.1f}' cy='{Y(v):.1f}' r='4.5' fill='{c}' "
+                     f"fill-opacity='.85' stroke='#150d14' stroke-width='.9' "
+                     f"data-tip='{esc(tip)}'/>")
+
+    for t, anchor in ((t0, "start"), (t1, "end")):
+        parts.append(f"<text x='{X(t):.1f}' y='{h - 8}' class='axis' text-anchor='{anchor}'>"
+                     f"{esc(local(t).strftime('%d %b'))}</text>")
+    parts.append("</svg>")
+    return "".join(parts)
+
+
+def svg_donut(slices, note="", size=210):
+    """
+    Ring chart from stroke-dasharray segments — no arc-path maths, and each
+    segment is a single element that can carry its own tooltip.
+
+    slices: [(label, value, colour)]
+    """
+    slices = [(lab, v, c) for lab, v, c in slices if v]
+    total = sum(v for _, v, _ in slices)
+    if not total:
+        return "<div class='empty'>no data</div>"
+
+    r, sw = 62, 26
+    circ = 2 * math.pi * r
+    cx = cy = size / 2
+    out = [f"<svg viewBox='0 0 {size} {size}' class='donut' role='img'>"]
+    out.append(f"<circle cx='{cx}' cy='{cy}' r='{r}' fill='none' "
+               f"stroke='rgba(255,255,255,.06)' stroke-width='{sw}'/>")
+    acc = 0.0
+    for lab, v, c in slices:
+        frac = v / total
+        seg = frac * circ
+        tip = f"{lab}\n{v:,} ({frac * 100:.1f}%)"
+        out.append(
+            f"<circle class='seg' cx='{cx}' cy='{cy}' r='{r}' fill='none' stroke='{c}' "
+            f"stroke-width='{sw}' stroke-dasharray='{seg:.2f} {circ - seg:.2f}' "
+            f"stroke-dashoffset='{-acc * circ:.2f}' "
+            f"transform='rotate(-90 {cx} {cy})' data-tip='{esc(tip)}'/>")
+        acc += frac
+    biggest = max(slices, key=lambda s: s[1])
+    out.append(f"<text x='{cx}' y='{cy - 2}' class='dn-big' text-anchor='middle'>"
+               f"{biggest[1] / total * 100:.0f}%</text>")
+    out.append(f"<text x='{cx}' y='{cy + 16}' class='dn-sub' text-anchor='middle'>"
+               f"{esc(biggest[0])}</text>")
+    out.append("</svg>")
+
+    legend = "".join(
+        f"<div class='dn-row'><i style='background:{c}'></i>"
+        f"<span class='dn-l'>{esc(lab)}</span>"
+        f"<span class='dn-v'>{v:,}</span>"
+        f"<span class='dn-p'>{v / total * 100:.1f}%</span></div>"
+        for lab, v, c in slices)
+    foot = f"<div class='dn-note'>{esc(note)}</div>" if note else ""
+    return (f"<div class='donut-wrap'>{''.join(out)}"
+            f"<div class='dn-legend'>{legend}{foot}</div></div>")
+
+
+def linreg(pairs):
+    """(slope, intercept) by least squares, or None when undetermined."""
+    pts = [(x, y) for x, y in pairs if x is not None and y is not None]
+    if len(pts) < 3:
+        return None
+    xs = [p[0] for p in pts]
+    ys = [p[1] for p in pts]
+    mx, my = mean(xs), mean(ys)
+    denom = sum((x - mx) ** 2 for x in xs)
+    if not denom:
+        return None
+    slope = sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / denom
+    return slope, my - slope * mx
+
+
+def svg_pp_scatter(scores, w=1140, h=340):
+    """
+    Every top play as a point: when it was set against what it was worth.
+
+    The trend line answers the question the table cannot — whether the plays
+    being added lately are worth more than the ones they are replacing.
+    """
+    pts = []
+    for s in scores:
+        t = parse_iso(s.get("ended_at") or s.get("created_at"))
+        pp = s.get("pp")
+        if t and pp:
+            pts.append((t, pp, s))
+    if len(pts) < 3:
+        return "<div class='empty'>not enough dated plays yet</div>"
+    pts.sort(key=lambda p: p[0])
+
+    pad_l, pad_r, pad_t, pad_b = 54, 18, 18, 32
+    pw, ph = w - pad_l - pad_r, h - pad_t - pad_b
+    # five divisions keeps the top tick close to the real maximum; four would
+    # round a 43pp best all the way up to 60 and waste a third of the height
+    ticks, ymin, ymax = nice_ticks(0, max(p[1] for p in pts), 5)
+    t0, t1 = pts[0][0], pts[-1][0]
+    span = (t1 - t0).total_seconds() or 1
+
+    def X(t):
+        return pad_l + (t - t0).total_seconds() / span * pw
+
+    def Y(v):
+        return pad_t + (1 - (v - ymin) / (ymax - ymin or 1)) * ph
+
+    out = [f"<svg viewBox='0 0 {w} {h}' class='chart chart-tall' role='img' data-cross='1'>"]
+    out.append(f"<line class='crosshair' x1='0' y1='{pad_t}' x2='0' y2='{pad_t + ph}'/>")
+    out.append(f"<rect x='{pad_l}' y='{pad_t}' width='{pw}' height='{ph}' "
+                 f"fill='none' pointer-events='all'/>")
+    for tv in ticks:
+        y = Y(tv)
+        if not (pad_t - 1 <= y <= pad_t + ph + 1):
+            continue
+        out.append(f"<line x1='{pad_l}' y1='{y:.1f}' x2='{w - pad_r}' y2='{y:.1f}' class='grid'/>")
+        out.append(f"<text x='{pad_l - 9}' y='{y + 3.5:.1f}' class='axis' text-anchor='end'>{tv:.0f}</text>")
+
+    # six evenly spaced date labels along the bottom
+    for i in range(6):
+        t = t0 + (t1 - t0) * (i / 5)
+        anchor = "start" if i == 0 else "end" if i == 5 else "middle"
+        out.append(f"<text x='{X(t):.1f}' y='{h - 10}' class='axis' text-anchor='{anchor}'>"
+                   f"{esc(local(t).strftime('%d %b'))}</text>")
+
+    fit = linreg([((t - t0).total_seconds(), pp) for t, pp, _ in pts])
+    if fit:
+        slope, intercept = fit
+        ya = max(ymin, min(ymax, intercept))
+        yb = max(ymin, min(ymax, slope * span + intercept))
+        out.append(f"<line x1='{pad_l}' y1='{Y(ya):.1f}' x2='{w - pad_r}' y2='{Y(yb):.1f}' "
+                   f"class='trend-pp'/>")
+
+    for t, pp, s in pts:
+        g = grade_of(s)
+        c = GRADE_COLORS.get(g, "#8b7f92")
+        bms = s.get("beatmapset") or {}
+        bm = s.get("beatmap") or {}
+        tip = (f"{bms.get('title', '?')} [{bm.get('version', '')}]\n"
+               f"{pp:.2f}pp · {(s.get('accuracy') or 0) * 100:.2f}% · "
+               f"{GRADE_LABELS.get(g, g[0])} · {bm.get('difficulty_rating') or 0:.2f}★"
+               f" · {bm.get('bpm') or '?'}bpm · AR{bm.get('ar') or '?'}\n"
+               f"{fmt_when(t)}  ({fmt_ago(t)})\n"
+               f"click to open on osu.ppy.sh ↗")
+        url = bm.get("url") or ""
+        # data-series groups the point with the rest of its grade, so hovering
+        # one lifts the whole series and fades the others
+        out.append(
+            f"<a href='{esc(url)}' target='_blank' rel='noopener'>"
+            f"<circle class='pt' cx='{X(t):.1f}' cy='{Y(pp):.1f}' r='5' fill='{c}' "
+            f"fill-opacity='.85' stroke='#150d14' stroke-width='1' "
+            f"data-series='{esc(GRADE_LABELS.get(g, g[0]))}' "
+            f"data-tip='{esc(tip)}'/></a>")
+    out.append("</svg>")
+
+    order = ["SS", "S", "A", "B", "C", "D", "F"]
+    seen = sorted({GRADE_LABELS.get(grade_of(s), grade_of(s)[0]) for _, _, s in pts},
+                  key=lambda g: order.index(g) if g in order else len(order))
+    legend = "".join(
+        f"<span class='lg'><i style='background:"
+        f"{GRADE_COLORS.get(g if g != 'SS' else 'X', '#8b7f92')}'></i>{esc(g)}</span>"
+        for g in seen)
+    legend += "<span class='lg'><i class='lg-line'></i>trend</span>"
+    return "".join(out) + f"<div class='legend'>{legend}</div>"
+
+
+STAR_BANDS = [(0, 2.5, "under 2.5★"), (2.5, 3.0, "2.5 – 3.0★"),
+              (3.0, 3.5, "3.0 – 3.5★"), (3.5, 4.0, "3.5 – 4.0★"),
+              (4.0, 99, "4.0★ and up")]
+
+
+def render_star_bands(rows):
+    """Median UR per star band — does precision hold up as maps get harder?"""
+    buckets = []
+    for lo, hi, label in STAR_BANDS:
+        vals = [r for r in rows if r.get("ur") and lo <= (r.get("stars") or 0) < hi]
+        if vals:
+            buckets.append((label, lo, hi, [r["ur"] for r in vals],
+                            [r["accuracy"] for r in vals if r.get("accuracy")]))
+    if not buckets:
+        return "<div class='empty'>no replay data yet</div>"
+
+    hi_ur = max(max(u) for _, _, _, u, _ in buckets)
+    out = ["<div class='bands'>"]
+    for label, lo, hi, urs, accs in buckets:
+        med = median(urs)
+        color = star_color((lo + min(hi, lo + 1)) / 2)
+        width = med / hi_ur * 100
+        acc_txt = f"{mean(accs):.1f}% acc" if accs else ""
+        out.append(
+            f"<div class='band'>"
+            f"<div class='band-label'>{esc(label)}<span class='band-n'>{len(urs)} play{'s' if len(urs) != 1 else ''}</span></div>"
+            f"<div class='band-track'><div class='band-fill' style='width:{width:.1f}%;"
+            f"background:linear-gradient(90deg,{color}55,{color})'></div>"
+            f"<span class='band-val'>{med:.0f} UR</span></div>"
+            f"<div class='band-sub'>{esc(acc_txt)}</div>"
+            f"</div>"
+        )
+    out.append("</div>")
+    return "".join(out)
+
+
+def render_acc_histogram(scores):
+    """Where accuracy actually lands across the plays in view."""
+    accs = [(s.get("accuracy") or 0) * 100 for s in scores]
+    if len(accs) < 3:
+        return "<div class='empty'>not enough plays</div>"
+    edges = [(0, 70), (70, 80), (80, 85), (85, 90), (90, 95), (95, 100.01)]
+    labels = ["<70", "70-80", "80-85", "85-90", "90-95", "95+"]
+    counts = [sum(1 for a in accs if lo <= a < hi) for lo, hi in edges]
+    top = max(counts) or 1
+    bars = []
+    for label, c in zip(labels, counts):
+        pct = c / top * 100
+        cls = " zero" if not c else ""
+        bars.append(
+            f"<div class='hbar{cls}'><div class='hbar-col'>"
+            f"<div class='hbar-fill' style='height:{pct:.1f}%'></div></div>"
+            f"<div class='hbar-n'>{c}</div><div class='hbar-l'>{esc(label)}</div></div>"
+        )
+    return f"<div class='hist'>{''.join(bars)}</div>"
+
+
+# -------------------------------------------------------------- play tables --
+
+def play_row(i, score, ur_entry, ur_lo, ur_hi):
+    bm = score.get("beatmap") or {}
+    bms = score.get("beatmapset") or {}
+    stats = score.get("statistics") or {}
+    sr = bm.get("difficulty_rating") or 0
+    sc = star_color(sr)
+    acc = (score.get("accuracy") or 0) * 100
+    pp = score.get("pp")
+    grade = grade_of(score)
+    gc = GRADE_COLORS.get(grade, "#8b8a9b")
+    misses = stats.get("miss") or stats.get("count_miss") or 0
+    combo = score.get("max_combo")
+    when = parse_iso(score.get("ended_at") or score.get("created_at"))
+    mods = mods_of(score)
+
+    if ur_entry and ur_entry.get("ur"):
+        ur = ur_entry["ur"]
+        cls = "ur-good" if ur <= ur_lo else "ur-bad" if ur >= ur_hi else "ur-mid"
+        ur_cell = f"<span class='ur {cls}' title='unstable rate, lower is steadier'>{ur:.0f}</span>"
+    else:
+        ur_cell = "<span class='ur ur-none' title='no replay stored for this score'>–</span>"
+
+    mod_html = "".join(f"<span class='mod {mod_class(m)}'>{esc(m)}</span>" for m in mods) or \
+               "<span class='mod mod-nm'>NM</span>"
+
+    letter = GRADE_LABELS.get(grade, grade[0])
+    g_size = "11px" if len(letter) > 1 else "14px"
+
+    return (
+        f"<div class='play' style='--sr:{sc}'>"
+        f"<div class='p-idx'>{i}</div>"
+        f"<div class='p-star'><span class='sr' style='background:{sc};color:{readable_on(sc)}'>"
+        f"<i>★</i>{sr:.2f}</span></div>"
+        f"<div class='p-map'>"
+        f"<a class='p-title' href='{esc(bm.get('url') or '#')}' target='_blank' "
+        f"rel='noopener' title='open this difficulty on osu.ppy.sh'>"
+        f"{esc(bms.get('title', '?'))}<span class='ext'>↗</span></a>"
+        f"<div class='p-meta'><span class='p-diff'>{esc(bm.get('version', ''))}</span>"
+        f"<span class='p-artist'>{esc(bms.get('artist', ''))}</span></div>"
+        f"</div>"
+        f"<div class='p-mods'>{mod_html}</div>"
+        f"<div class='p-grade'><span class='grade' style='background:{gc};font-size:{g_size}'>"
+        f"{esc(letter)}</span></div>"
+        f"<div class='p-acc'><div class='acc-n'>{acc:.2f}%</div>"
+        f"<div class='acc-bar'><i style='width:{max(0, min(100, (acc - 60) / 40 * 100)):.1f}%'></i></div></div>"
+        f"<div class='p-pp'>{f'{pp:.0f}' if pp else '–'}<small>pp</small></div>"
+        f"<div class='p-ur'>{ur_cell}</div>"
+        f"<div class='p-misc'>"
+        f"{f'<span class=miss>{misses}✕</span>' if misses else '<span class=fc>FC</span>' if combo else ''}"
+        f"<span class='p-when'>{esc(fmt_ago(when))}</span></div>"
+        f"</div>"
+    )
+
+
+def play_table(scores, ur_map, ur_lo, ur_hi, empty_msg):
+    if not scores:
+        return f"<div class='empty'>{esc(empty_msg)}</div>"
+    head = ("<div class='play head'><div class='p-idx'></div><div class='p-star'>diff</div>"
+            "<div class='p-map'>map</div><div class='p-mods'>mods</div><div class='p-grade'></div>"
+            "<div class='p-acc'>accuracy</div><div class='p-pp'>pp</div><div class='p-ur'>UR</div>"
+            "<div class='p-misc'></div></div>")
+    rows = [play_row(i, s, ur_map.get(ost._score_key(s)), ur_lo, ur_hi)
+            for i, s in enumerate(scores, 1)]
+    return f"<div class='plays'>{head}{''.join(rows)}</div>"
+
+
+# ------------------------------------------------------------------- stat ui --
+
+def stat(label, value, sub="", delta_html="", accent=None):
+    style = f" style='color:{accent}'" if accent else ""
+    return (
+        f"<div class='stat'><div class='s-label'>{esc(label)}</div>"
+        f"<div class='s-value'{style}>{value}</div>"
+        f"<div class='s-sub'>{sub}{delta_html}</div></div>"
+    )
+
+
+def delta_html(new, old, fmt=None, invert=False):
+    """
+    Change since the start of the session, formatted by `fmt`.
+    invert=True means a decrease is an improvement (rank, UR).
+    """
+    if new is None or old is None:
+        return ""
+    fmt = fmt or (lambda v: f"{v:,.0f}")
+    d = new - old
+    if not round(d, 4):
+        return "<span class='d flat'>no change</span>"
+    good = (d < 0) if invert else (d > 0)
+    arrow = "▲" if d > 0 else "▼"
+    return f"<span class='d {'up' if good else 'down'}'>{arrow} {fmt(abs(d))}</span>"
+
+
+# ---------------------------------------------------------------------- css --
+
+def build_css(cover=None, ratio=None):
+    tri_page = triangles(640, 540, 30, "#ffffff", .006, .020, seed=11,
+                         smin=.04, smax=.13)
+    tri_hero = triangles(420, 300, 22, "#ffffff", .035, .11, seed=3,
+                         smin=.07, smax=.26)
+    # declared once, shared by the page backdrop and the hero banner
+    cover_var = f'  --cover:url("{cover}");' if cover else "  --cover:none;"
+    if cover and ratio:
+        cover_var += f"\n  --cover-ratio:{ratio};"
+    hero_fallback = "linear-gradient(110deg,var(--pink-d) 0%,#7a3b7d 42%,#4a2a63 100%)"
+    return """
+*{box-sizing:border-box;margin:0;padding:0}
+""" + font_face() + """
+:root{
+  --bg:#1a1017; --bg2:#251728;
+  --panel:rgba(255,255,255,.055); --panel2:rgba(255,255,255,.028);
+  --line:rgba(255,255,255,.09);
+  /* --faint carries axis labels and timestamps; #7d7186 measured 3.76:1 on
+     the cover backdrop, under the 4.5:1 AA floor for small text */
+  --text:#f2eef4; --dim:#b0a3b5; --faint:#908399;
+  --pink:#ff66ab; --pink-d:#cc5288; --purple:#8866ee; --purple-l:#aa88ff;
+  --blue:#66ccff; --yellow:#ffcc22; --green:#b3d944; --red:#ff6666;
+COVER_VAR
+  --mono:"JetBrains Mono","JetBrainsMono Nerd Font",ui-monospace,monospace;
+  --sans:"Torus Sub","Rubik","Varela Round",system-ui,-apple-system,sans-serif;
+  --r:14px;
+}
+/* The base colour lives on html, not body: a z-index:-1 child paints *before*
+   its parent's own background, so an opaque body would hide .bg entirely. */
+html{background:var(--bg)}
+body{
+  font-family:var(--sans); color:var(--text); line-height:1.5;
+  font-optical-sizing:auto; background:transparent;
+  min-height:100vh; padding:0 0 60px;
+  -webkit-font-smoothing:antialiased;
+}
+/* Backdrop stack, bottom to top: the profile cover blurred out of focus,
+   a heavy dark wash so body text keeps its contrast, then the glows and
+   triangles. Sits behind all content via z-index. */
+.bg{position:fixed;inset:0;z-index:-1;overflow:hidden;pointer-events:none}
+.bg-img{position:absolute;inset:-60px;background:var(--cover) center/cover no-repeat;
+  filter:blur(30px) saturate(1.3);transform:scale(1.07)}
+.bg::after{content:"";position:absolute;inset:0;
+  background:
+    url("TRI_PAGE"),
+    radial-gradient(1200px 700px at 8% -10%, rgba(255,102,171,.14), transparent 60%),
+    radial-gradient(1000px 600px at 92% 4%, rgba(136,102,238,.14), transparent 58%),
+    linear-gradient(170deg, rgba(24,14,26,.74) 0%, rgba(18,11,19,.84) 46%, rgba(13,8,14,.90) 100%);
+}
+.wrap{max-width:1280px;margin:0 auto;padding:0 26px}
+
+/* toolbar — lazer's top bar */
+.toolbar{background:rgba(10,6,10,.88);border-bottom:1px solid rgba(255,255,255,.06);
+  backdrop-filter:blur(12px);margin-bottom:26px;position:sticky;top:0;z-index:50}
+.toolbar .wrap{display:flex;align-items:center;gap:8px;height:52px}
+/* the osu! mark: outlined by default, filling pink on hover, as on osu.ppy.sh */
+.tb-logo{width:34px;height:34px;border-radius:50%;flex:none;
+  display:grid;place-items:center;text-decoration:none;
+  border:2px solid #fff;background:transparent;color:#fff;
+  font-weight:700;font-size:11.5px;letter-spacing:-.3px;
+  transition:background-color .18s ease, box-shadow .18s ease, transform .18s ease}
+.tb-logo:hover{background:var(--pink);box-shadow:0 0 20px rgba(255,102,171,.6);
+  transform:scale(1.07)}
+.tb-logo:active{transform:scale(.98)}
+.tb-item{font-size:13px;font-weight:500;color:var(--dim);padding:0 14px;height:52px;
+  display:flex;align-items:center;border-bottom:3px solid transparent;
+  text-decoration:none;transition:color .12s,border-color .12s}
+.tb-item:hover{color:#fff;border-bottom-color:rgba(255,102,171,.5)}
+.tb-item.on{color:#fff;border-bottom-color:var(--pink)}
+.tb-right{margin-left:auto;display:flex;align-items:center;gap:14px;
+  font-size:12px;color:var(--faint);font-family:var(--mono)}
+section[id]{scroll-margin-top:64px}
+
+/* hero — the cover shown whole, then the profile row beneath it, the way
+   osu-web lays out a player page. No triangles here; the artwork is the point. */
+.hero{position:relative;overflow:hidden;border-radius:20px;
+  background:rgba(14,8,17,.66);border:1px solid var(--line);
+  box-shadow:0 16px 44px rgba(0,0,0,.5)}
+.hero-banner{position:relative;width:100%;
+  aspect-ratio:var(--cover-ratio,1000/260);max-height:340px;
+  background:var(--cover) center/cover no-repeat}
+/* the level bar and grade chips sit in the lower third, so it has to be dark
+   enough for them regardless of what the artwork does there */
+.hero-fade{position:absolute;inset:0;background:linear-gradient(180deg,
+  rgba(14,8,17,0) 28%,rgba(14,8,17,.38) 56%,rgba(14,8,17,.80) 80%,
+  rgba(14,8,17,.97) 100%)}
+.hero-body{position:relative;display:flex;align-items:flex-end;gap:22px;
+  flex-wrap:wrap;padding:0 26px 20px;margin-top:-52px}
+/* no cover: fall back to the original gradient band */
+.hero.plain{background:HERO_FALLBACK;padding-top:24px}
+.hero.plain .hero-body{margin-top:0;padding-top:0}
+.avatar-link{display:block;flex:none;line-height:0}
+.avatar{width:92px;height:92px;border-radius:20px;object-fit:cover;display:block;
+  border:3px solid rgba(255,255,255,.22);box-shadow:0 10px 30px rgba(0,0,0,.62)}
+.avatar.ph{display:grid;place-items:center;background:rgba(0,0,0,.3);
+  font-size:34px;font-weight:700;color:#fff}
+.who h1{font-size:32px;font-weight:700;letter-spacing:-.4px;line-height:1.1;
+  text-shadow:0 2px 12px rgba(0,0,0,.4)}
+.who .sub{color:rgba(255,255,255,.82);font-size:13.5px;margin-top:5px;
+  display:flex;gap:14px;flex-wrap:wrap;align-items:center}
+.who .sub b{font-weight:600;color:#fff}
+.spacer{flex:1}
+/* chips sit over the brighter end of the cover, so they carry their own scrim */
+.tag{font-size:11.5px;font-weight:500;color:rgba(255,255,255,.95);
+  border-radius:999px;padding:7px 15px;background:rgba(8,5,12,.52);
+  border:1px solid rgba(255,255,255,.18);backdrop-filter:blur(4px)}
+.hero-side{display:flex;flex-direction:column;align-items:flex-end;gap:10px}
+.lvl{display:flex;align-items:center;gap:10px;font-size:12px;color:rgba(255,255,255,.9)}
+.lvl b{font-weight:700;color:#fff}
+.lvl .track{width:132px;height:8px;border-radius:999px;background:rgba(8,5,12,.55);
+  overflow:hidden;border:1px solid rgba(255,255,255,.1)}
+.lvl .track i{display:block;height:100%;border-radius:999px;
+  background:linear-gradient(90deg,#ffcc22,#fff0a8)}
+.grades{display:flex;gap:7px}
+.gr{display:flex;align-items:center;gap:6px;font-size:12px;font-weight:600;color:#fff;
+  background:rgba(8,5,12,.52);border:1px solid rgba(255,255,255,.18);
+  border-radius:999px;padding:4px 12px;font-variant-numeric:tabular-nums;
+  backdrop-filter:blur(4px)}
+.gr s{text-decoration:none;font-weight:800;letter-spacing:-.3px}
+
+/* layout */
+section{margin-top:30px}
+h2{font-size:17px;font-weight:700;color:#fff;margin-bottom:14px;
+  display:flex;align-items:baseline;gap:12px;letter-spacing:-.2px}
+h2::before{content:"";width:4px;height:17px;border-radius:2px;background:var(--pink);
+  align-self:center;flex:none}
+h2 em{font-style:normal;font-weight:400;font-size:12.5px;color:var(--faint)}
+.panel{background:var(--panel2);border:1px solid var(--line);border-radius:var(--r);padding:20px 22px}
+.panel h2{font-size:13.5px;margin-bottom:10px}
+.panel h2::before{height:13px;width:3px}
+.grid{display:grid;gap:16px}
+.g3{grid-template-columns:repeat(3,1fr)}
+.g2{grid-template-columns:repeat(2,1fr)}
+
+/* stat tiles */
+.stats{display:grid;grid-template-columns:repeat(6,1fr);gap:10px}
+.stat{background:var(--panel);border:1px solid var(--line);border-radius:var(--r);
+  padding:15px 16px 13px;position:relative;overflow:hidden}
+.stat::after{content:"";position:absolute;left:0;top:0;bottom:0;width:3px;background:var(--purple);opacity:.55}
+.stat:nth-child(1)::after{background:var(--pink)}
+.stat:nth-child(2)::after{background:var(--blue)}
+.stat:nth-child(3)::after{background:var(--purple-l)}
+.stat:nth-child(4)::after{background:var(--green)}
+.stat:nth-child(5)::after{background:var(--yellow)}
+.stat:nth-child(6)::after{background:var(--red)}
+.s-label{font-size:10.5px;font-weight:500;letter-spacing:.08em;text-transform:uppercase;color:var(--faint)}
+.s-value{font-size:26px;font-weight:700;letter-spacing:-1px;margin-top:5px;line-height:1.1;
+  white-space:nowrap;font-variant-numeric:tabular-nums}
+.s-sub{font-size:11.5px;color:var(--dim);margin-top:4px;height:17px;
+  display:flex;align-items:center;gap:7px;white-space:nowrap}
+.d{font-size:11.5px;font-weight:600;font-variant-numeric:tabular-nums}
+.d.up{color:var(--green)} .d.down{color:var(--red)} .d.flat{color:var(--faint);font-weight:400}
+
+/* play rows */
+.plays{border:1px solid var(--line);border-radius:var(--r);overflow:hidden;background:var(--panel2)}
+.play{display:grid;align-items:center;gap:13px;padding:10px 18px 10px 14px;
+  grid-template-columns:24px 74px minmax(190px,1fr) 92px 34px 112px 62px 48px 118px;
+  border-top:1px solid rgba(255,255,255,.055);position:relative}
+.play:first-child{border-top:none}
+.play:not(.head)::before{content:"";position:absolute;left:-2px;top:0;bottom:0;width:9px;
+  background:var(--sr,transparent);transform:skewX(-11deg)}
+.play:not(.head):hover{background:rgba(255,255,255,.05)}
+.play.head{font-size:10px;font-weight:500;letter-spacing:.1em;text-transform:uppercase;
+  color:var(--faint);padding:9px 18px 9px 14px;background:rgba(255,255,255,.03)}
+.p-idx{font-size:12.5px;font-weight:600;color:var(--faint);text-align:right;
+  font-variant-numeric:tabular-nums}
+/* lazer's star-rating pill */
+.sr{display:inline-flex;align-items:center;justify-content:center;gap:3px;
+  font-size:11.5px;font-weight:700;border-radius:999px;padding:4px 9px;width:100%;
+  font-variant-numeric:tabular-nums;box-shadow:0 1px 5px rgba(0,0,0,.35)}
+.sr i{font-style:normal;font-size:9.5px;opacity:.9}
+.head .p-star{color:var(--faint)}
+.p-title{font-size:14px;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.p-meta{display:flex;gap:8px;font-size:11.5px;color:var(--faint);margin-top:0;
+  white-space:nowrap;overflow:hidden}
+.p-diff{color:var(--dim);font-weight:500}
+.p-artist{overflow:hidden;text-overflow:ellipsis}
+.p-mods{display:flex;gap:4px;flex-wrap:wrap}
+.mod{font-size:10px;font-weight:700;padding:3px 6px;border-radius:6px;letter-spacing:.02em}
+.mod-increase{background:rgba(255,102,102,.2);color:#ff8f8f}
+.mod-reduction{background:rgba(179,217,68,.2);color:var(--green)}
+.mod-automation{background:rgba(102,204,255,.2);color:var(--blue)}
+.mod-fun{background:rgba(170,136,255,.2);color:var(--purple-l)}
+.mod-nm{background:rgba(255,255,255,.06);color:var(--faint);font-weight:500}
+/* lazer grade badge */
+.grade{font-size:14px;font-weight:800;display:grid;place-items:center;
+  width:30px;height:22px;border-radius:7px;color:#221018;letter-spacing:-.3px;
+  box-shadow:0 1px 5px rgba(0,0,0,.4)}
+.acc-n{font-size:13.5px;font-weight:600;font-variant-numeric:tabular-nums}
+.acc-bar{height:3px;background:rgba(255,255,255,.1);border-radius:2px;margin-top:4px;overflow:hidden}
+.acc-bar i{display:block;height:100%;background:linear-gradient(90deg,var(--blue),var(--green));border-radius:2px}
+.p-pp{font-size:17px;font-weight:700;color:var(--pink);text-align:right;
+  font-variant-numeric:tabular-nums;letter-spacing:-.4px}
+.p-pp small{font-size:9.5px;font-weight:500;color:var(--faint);margin-left:2px}
+.p-ur{text-align:right}
+.ur{font-size:12.5px;font-weight:700;padding:3px 8px;border-radius:999px;
+  font-variant-numeric:tabular-nums}
+.ur-good{background:rgba(179,217,68,.18);color:var(--green)}
+.ur-mid{background:rgba(255,204,34,.16);color:var(--yellow)}
+.ur-bad{background:rgba(255,102,102,.16);color:var(--red)}
+.ur-none{background:rgba(255,255,255,.06);color:var(--faint);font-weight:500}
+.p-misc{display:flex;align-items:center;justify-content:flex-end;gap:9px;
+  font-size:11px;color:var(--faint);font-variant-numeric:tabular-nums}
+.miss{color:var(--red);font-weight:700}
+.fc{color:var(--green);font-weight:700}
+
+/* charts */
+.chart{width:100%;height:auto;display:block;overflow:visible}
+.grid{stroke:rgba(255,255,255,.08);stroke-width:1}
+.axis{fill:var(--faint);font-family:var(--mono);font-size:10px}
+.trend{stroke:var(--yellow);stroke-width:1.8;stroke-dasharray:5 4;opacity:.75}
+.empty{color:var(--faint);font-size:13px;padding:26px 4px;text-align:center}
+
+/* star bands */
+.bands{display:flex;flex-direction:column;gap:13px}
+.band-label{display:flex;justify-content:space-between;font-size:12.5px;color:var(--dim);
+  margin-bottom:5px;font-weight:500}
+.band-n{color:var(--faint);font-size:11px}
+.band-track{position:relative;height:26px;background:rgba(255,255,255,.06);
+  border-radius:999px;overflow:hidden}
+.band-fill{height:100%;border-radius:999px}
+.band-val{position:absolute;right:11px;top:50%;transform:translateY(-50%);
+  font-size:12px;font-weight:700;color:#fff;font-variant-numeric:tabular-nums;
+  text-shadow:0 1px 4px rgba(0,0,0,.6)}
+.band-sub{font-size:11px;color:var(--faint);margin-top:3px}
+
+/* histogram */
+.hist{display:flex;gap:10px;align-items:flex-end;height:168px;padding-top:8px}
+.hbar{flex:1;display:flex;flex-direction:column;align-items:center;height:100%}
+.hbar-col{flex:1;width:100%;display:flex;align-items:flex-end;
+  border-bottom:1px solid rgba(255,255,255,.14)}
+.hbar-fill{width:100%;background:linear-gradient(180deg,var(--pink),#7d4fc9);
+  border-radius:8px 8px 0 0;min-height:2px}
+.hbar.zero .hbar-fill{background:rgba(255,255,255,.07)}
+.hbar-n{font-size:12.5px;font-weight:700;margin-top:7px;font-variant-numeric:tabular-nums}
+.hbar-l{font-size:10.5px;color:var(--faint);margin-top:1px}
+
+/* session strip */
+.strip{display:grid;grid-template-columns:repeat(auto-fit,minmax(128px,1fr));gap:22px}
+.strip .k{font-size:10.5px;font-weight:500;letter-spacing:.08em;text-transform:uppercase;color:var(--faint)}
+.strip .v{font-size:23px;font-weight:700;margin-top:4px;letter-spacing:-.6px;
+  font-variant-numeric:tabular-nums}
+.strip .n{font-size:11.5px;color:var(--dim);margin-top:2px;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+
+/* pp scatter */
+.chart-tall{min-height:300px}
+.trend-pp{stroke:var(--purple-l);stroke-width:2;stroke-dasharray:6 5;opacity:.8}
+.legend{display:flex;gap:16px;flex-wrap:wrap;margin-top:12px;padding-left:54px}
+.lg{display:flex;align-items:center;gap:6px;font-size:11.5px;color:var(--dim)}
+.lg i{width:10px;height:10px;border-radius:50%;display:block}
+.lg .lg-line{width:16px;height:0;border-top:2px dashed var(--purple-l);border-radius:0}
+
+/* donuts */
+.donuts{display:grid;grid-template-columns:repeat(2,1fr);gap:16px}
+.donut-wrap{display:flex;align-items:center;gap:24px;flex-wrap:wrap}
+.donut{width:210px;height:210px;flex:none;overflow:visible}
+.seg{transition:stroke-width .14s ease, filter .14s ease;cursor:default}
+.seg:hover{stroke-width:31;filter:brightness(1.18)}
+.dn-big{fill:var(--text);font-size:27px;font-weight:700;letter-spacing:-1px}
+.dn-sub{fill:var(--faint);font-size:11.5px}
+.dn-legend{flex:1;min-width:180px;display:flex;flex-direction:column;gap:7px}
+.dn-row{display:flex;align-items:center;gap:9px;font-size:13px}
+.dn-row i{width:11px;height:11px;border-radius:3px;flex:none}
+.dn-l{color:var(--dim);flex:1}
+.dn-v{font-weight:600;font-variant-numeric:tabular-nums}
+.dn-p{color:var(--faint);font-size:11.5px;width:48px;text-align:right;
+  font-variant-numeric:tabular-nums}
+.dn-note{color:var(--faint);font-size:11.5px;margin-top:5px;padding-top:7px;
+  border-top:1px solid var(--line)}
+
+/* crosshair */
+.crosshair{stroke:rgba(255,255,255,.3);stroke-width:1;stroke-dasharray:3 3;
+  opacity:0;transition:opacity .1s}
+.chart.cross-on .crosshair{opacity:1}
+
+/* map links */
+.p-title{color:var(--text);text-decoration:none;display:inline-flex;align-items:center;gap:5px;
+  max-width:100%;transition:color .13s}
+.p-title:hover{color:var(--pink)}
+.ext{font-size:10px;opacity:0;transform:translateX(-3px);
+  transition:opacity .13s,transform .13s;color:var(--pink);flex:none}
+.p-title:hover .ext{opacity:1;transform:translateX(0)}
+
+/* motion */
+@keyframes riseIn{from{opacity:0;transform:translateY(14px)}to{opacity:1;transform:none}}
+@keyframes fadeIn{from{opacity:0}to{opacity:1}}
+.hero,.stats,section{animation:riseIn .5s cubic-bezier(.22,.9,.3,1) both}
+section:nth-of-type(1){animation-delay:.05s}
+section:nth-of-type(2){animation-delay:.10s}
+section:nth-of-type(3){animation-delay:.15s}
+section:nth-of-type(4){animation-delay:.20s}
+section:nth-of-type(5){animation-delay:.25s}
+section:nth-of-type(6){animation-delay:.30s}
+.play:not(.head){animation:fadeIn .4s ease both}
+.stat,.panel,.play:not(.head),.sr,.grade,.ur,.mod,.band-fill,.hbar-fill{
+  transition:transform .14s cubic-bezier(.22,.9,.3,1),
+             background-color .14s, box-shadow .14s, border-color .14s}
+.stat:hover{transform:translateY(-3px);border-color:rgba(255,255,255,.2);
+  box-shadow:0 10px 26px rgba(0,0,0,.42)}
+.panel:hover{border-color:rgba(255,255,255,.16)}
+.play:not(.head):hover{transform:translateX(5px)}
+.play:not(.head)::before{transition:width .14s cubic-bezier(.22,.9,.3,1)}
+.play:not(.head):hover::before{width:14px}
+.play:not(.head):hover .sr{transform:scale(1.07)}
+.play:not(.head):hover .grade{transform:scale(1.1)}
+.hbar:hover .hbar-fill{filter:brightness(1.18)}
+.band:hover .band-fill{filter:brightness(1.15)}
+.avatar{transition:transform .2s cubic-bezier(.22,.9,.3,1)}
+.avatar:hover{transform:scale(1.05) rotate(-2deg)}
+.pt{transition:r .12s ease, fill-opacity .12s ease, opacity .12s ease;cursor:pointer}
+.pt:hover{r:8;fill-opacity:1}
+/* hovering a point pushes every other series back */
+.chart.focus .pt{opacity:.14}
+.chart.focus .pt.lit{opacity:1}
+.chart .pt.sel{r:8;fill-opacity:1}
+
+/* cursor-following tooltip for chart points */
+#tip{position:fixed;z-index:200;pointer-events:none;opacity:0;
+  transform:translateY(4px);transition:opacity .1s,transform .1s;
+  background:rgba(12,7,12,.97);border:1px solid rgba(255,255,255,.16);
+  border-radius:10px;padding:8px 11px;font-size:12px;line-height:1.45;
+  color:var(--text);white-space:pre-line;max-width:330px;
+  box-shadow:0 12px 34px rgba(0,0,0,.6)}
+#tip.on{opacity:1;transform:none}
+
+@media (prefers-reduced-motion:reduce){
+  *,*::before,*::after{animation:none!important;transition:none!important}
+}
+
+footer{margin-top:40px;padding-top:18px;border-top:1px solid var(--line);
+  color:var(--faint);font-size:11.5px;display:flex;gap:18px;flex-wrap:wrap}
+footer code{font-family:var(--mono);color:var(--dim)}
+
+@media (max-width:1080px){
+  .stats{grid-template-columns:repeat(3,1fr)}
+  .g3,.g2{grid-template-columns:1fr}
+  .play{grid-template-columns:24px 70px minmax(150px,1fr) 76px 32px 96px 56px 46px;gap:10px}
+  .p-misc{display:none}
+}
+@media (max-width:680px){
+  .wrap{padding:0 14px}
+  .stats{grid-template-columns:repeat(2,1fr)}
+  .play{grid-template-columns:66px minmax(120px,1fr) 88px 52px 44px}
+  .p-idx,.p-mods,.p-grade{display:none}
+  .hero{padding:18px}
+  .who h1{font-size:25px}
+}
+""".replace("TRI_PAGE", tri_page).replace("TRI_HERO", tri_hero)\
+       .replace("COVER_VAR", cover_var).replace("HERO_FALLBACK", hero_fallback)
+
+
+# ------------------------------------------------------------------- render --
+
+def render(d):
+    snap, prev, history = d["snap"], d["prev"], d["history"]
+    session_start = d["session_start"]
+    ur_rows = d["ur_rows"]
+    urs = [r["ur"] for r in ur_rows if r.get("ur")]
+    ur_lo = percentile(urs, 0.25) if urs else 0
+    ur_hi = percentile(urs, 0.75) if urs else 0
+
+    out = []
+    A = out.append
+
+    # ---- header
+    if d.get("avatar_uri"):
+        av = f"<img class='avatar' src='{d['avatar_uri']}' alt=''>"
+    else:
+        av = f"<div class='avatar ph'>{esc((snap.get('username') or '?')[0].upper())}</div>"
+    if snap.get("user_id"):
+        av = (f"<a class='avatar-link' href='https://osu.ppy.sh/users/{snap['user_id']}' "
+              f"target='_blank' rel='noopener' title='open your osu! profile'>{av}</a>")
+    scope = (f"session · last {d['hours']}h" if d["session_scores"]
+             else f"last {d['hours']}h · no scores")
+
+    A("<div class='bg'><div class='bg-img'></div></div>")
+    A(f"""<div class='toolbar'><div class='wrap'>
+      <a class='tb-logo' href='https://osu.ppy.sh/' target='_blank'
+         rel='noopener' title='osu.ppy.sh'>osu!</a>
+      <a class='tb-item on' href='#session'>session</a>
+      <a class='tb-item' href='#topplays'>top plays</a>
+      <a class='tb-item' href='#progress'>progress</a>
+      <a class='tb-item' href='#consistency'>consistency</a>
+      <span class='tb-right'>{esc(fmt_when(parse_iso(snap['timestamp'])))}</span>
+    </div></div>""")
+
+    banner = ("<div class='hero-banner'><div class='hero-fade'></div></div>"
+              if d.get("cover_uri") else "")
+    A(f"""<div class='wrap'><div class='hero{'' if d.get('cover_uri') else ' plain'}'>
+      {banner}
+      <div class='hero-body'>{av}
+      <div class='who'><h1>{esc(snap.get('username') or 'osu!')}</h1>
+        <div class='sub'>
+          <span>global <b>#{snap['global_rank']:,}</b></span>
+          <span>country <b>#{snap['country_rank']:,}</b></span>
+          <span>{snap['play_count']:,} plays · {fmt_dur(snap.get('play_time'))}</span>
+        </div></div>
+      <div class='spacer'></div>
+      <div class='hero-side'>
+        <div class='tag'>{esc(scope)}</div>
+        <div class='lvl'>LV <b>{snap.get('level') or '–'}</b>
+          <span class='track'><i style='width:{snap.get('level_progress') or 0}%'></i></span>
+          <span>{snap.get('level_progress') or 0}%</span></div>
+        <div class='grades'>
+          <span class='gr'><s style='color:#ffd966'>SS</s>{snap.get('ss') or 0}</span>
+          <span class='gr'><s style='color:#e8eef5'>S</s>{snap.get('s') or 0}</span>
+          <span class='gr'><s style='color:#b3d944'>A</s>{snap.get('a') or 0}</span>
+        </div>
+      </div>
+      </div>
+    </div>""")
+
+    # ---- headline stats, compared against the start of the session
+    base = session_start or prev
+    ranks = lambda v: f"{v:,.0f} ranks"
+    A("<div class='stats'>")
+    A(stat("performance", f"{snap['pp']:,.0f}", "",
+           delta_html(snap["pp"], base and base.get("pp"), lambda v: f"{v:,.1f} pp"),
+           "var(--pink)"))
+    A(stat("global rank", f"#{snap['global_rank']:,}", "",
+           delta_html(snap["global_rank"], base and base.get("global_rank"), ranks, invert=True),
+           "var(--blue)"))
+    A(stat("country", f"#{snap['country_rank']:,}", "",
+           delta_html(snap["country_rank"], base and base.get("country_rank"), ranks, invert=True)))
+    A(stat("hit accuracy", f"{snap['accuracy']:.2f}%", "",
+           delta_html(snap["accuracy"], base and base.get("accuracy"), lambda v: f"{v:.2f}%")))
+    A(stat("play count", f"{snap['play_count']:,}", "",
+           delta_html(snap["play_count"], base and base.get("play_count"),
+                      lambda v: f"{v:,.0f} plays")))
+    A(stat("play time", fmt_dur(snap.get("play_time")), "",
+           delta_html(snap.get("play_time"), base and base.get("play_time"), fmt_dur)))
+    A("</div>")
+
+    # ---- session strip
+    ss = d["session_scores"]
+    if ss:
+        accs = [(s.get("accuracy") or 0) * 100 for s in ss]
+        stars = [(s.get("beatmap") or {}).get("difficulty_rating")
+                 for s in ss if (s.get("beatmap") or {}).get("difficulty_rating")]
+        passed = sum(1 for s in ss if s.get("passed"))
+        best = max(ss, key=lambda s: s.get("pp") or 0)
+        best_title = (best.get("beatmapset") or {}).get("title", "?")
+        s_urs = [d["ur_map"][ost._score_key(s)]["ur"] for s in ss
+                 if ost._score_key(s) in d["ur_map"] and d["ur_map"][ost._score_key(s)].get("ur")]
+        pp_gain = (snap["pp"] - session_start["pp"]) if session_start else None
+
+        A(f"<section id='session'><h2>this session <em>{d['hours']}h window</em></h2>"
+          f"<div class='panel'><div class='strip'>")
+        A(f"<div><div class='k'>plays</div><div class='v'>{len(ss)}</div>"
+          f"<div class='n'>{passed} passed · {len(ss) - passed} failed</div></div>")
+        A(f"<div><div class='k'>avg accuracy</div><div class='v'>{mean(accs):.2f}%</div>"
+          f"<div class='n'>best {max(accs):.2f}%</div></div>")
+        if stars:
+            A(f"<div><div class='k'>avg difficulty</div><div class='v'>{mean(stars):.2f}★</div>"
+              f"<div class='n'>hardest {max(stars):.2f}★</div></div>")
+        if s_urs:
+            A(f"<div><div class='k'>median UR</div><div class='v'>{median(s_urs):.0f}</div>"
+              f"<div class='n'>best {min(s_urs):.0f} · {len(s_urs)} replay{'s' if len(s_urs) != 1 else ''}</div></div>")
+        if pp_gain is not None:
+            A(f"<div><div class='k'>pp gained</div><div class='v' style='color:var(--pink)'>"
+              f"{'+' if pp_gain >= 0 else ''}{pp_gain:.1f}</div>"
+              f"<div class='n'>{len(d['new_pbs'])} new personal best{'s' if len(d['new_pbs']) != 1 else ''}</div></div>")
+        A(f"<div><div class='k'>top play</div><div class='v' style='color:var(--pink)'>"
+          f"{(best.get('pp') or 0):.0f}<small style='font-size:11px;color:var(--faint)'>pp</small></div>"
+          f"<div class='n' title='{esc(best_title)}'>{esc(best_title)}</div></div>")
+        A("</div></div></section>")
+
+    # ---- top plays
+    A(f"<section><h2>best {len(d['session_top'])} this session "
+      f"<em>ranked by pp · UR shown where a replay exists</em></h2>")
+    A(play_table(d["session_top"], d["ur_map"], ur_lo, ur_hi,
+                 f"no passed scores in the last {d['hours']} hours"))
+    A("</section>")
+
+    A(f"<section id='topplays'><h2>all-time top {len(d['best_scores'])}</h2>")
+    A(play_table(d["best_scores"], d["ur_map"], ur_lo, ur_hi, "no top plays returned"))
+    A("</section>")
+
+    # ---- hit + grade composition, as osu!track presents them
+    hh = d.get("hits") or {}
+    if hh.get("count_300") or snap.get("s") or snap.get("a"):
+        hit_slices = [("300", hh.get("count_300") or 0, "#66ccff"),
+                      ("100", hh.get("count_100") or 0, "#b3d944"),
+                      ("50", hh.get("count_50") or 0, "#ffcc22")]
+        miss = hh.get("count_miss") or 0
+        # SS and S are both gold in osu!; split them light/dark so the ring
+        # stays readable without inventing a colour that means nothing
+        grade_slices = [("SS", snap.get("ss") or 0, "#ffd966"),
+                        ("S", snap.get("s") or 0, "#eeaa00"),
+                        ("A", snap.get("a") or 0, "#b3d944")]
+        A("<section id='composition'><h2>composition "
+          "<em>every ranked hit and grade on record</em></h2><div class='donuts'>")
+        A(f"<div class='panel'><h2 style='margin-bottom:14px'>hit accuracy"
+          f"<em>judgement split</em></h2>"
+          f"{svg_donut(hit_slices, f'{miss:,} misses, excluded from the ring')}</div>")
+        A(f"<div class='panel'><h2 style='margin-bottom:14px'>ranking ratio"
+          f"<em>ranked grades</em></h2>"
+          f"{svg_donut(grade_slices, 'SS and S include hidden-mod variants')}</div>")
+        A("</div></section>")
+
+    # ---- every top play, plotted when it was set against what it was worth
+    scatter_src = d.get("best_all") or d["best_scores"]
+    A(f"<section id='ppscatter'><h2>top plays over time "
+      f"<em>{len(scatter_src)} best plays · colour = grade · hover for detail, "
+      f"click to open the map</em></h2>"
+      f"<div class='panel'>{svg_pp_scatter(scatter_src)}</div></section>")
+
+    # ---- progress curves
+    hist = history + [snap]
+    pp_pts = [(parse_iso(h["timestamp"]), h.get("pp")) for h in hist]
+    rk_pts = [(parse_iso(h["timestamp"]), h.get("global_rank")) for h in hist]
+    ac_pts = [(parse_iso(h["timestamp"]), h.get("accuracy")) for h in hist]
+
+    A("<section id='progress'><h2>progress <em>every recorded snapshot</em></h2>"
+      "<div class='grid g3'>")
+    A(f"<div class='panel'><h2 style='margin-bottom:8px'>performance points</h2>"
+      f"{svg_timeseries(pp_pts, '#ff66ab', lambda v: f'{v:,.0f}')}</div>")
+    A(f"<div class='panel'><h2 style='margin-bottom:8px'>global rank <em>higher is better</em></h2>"
+      f"{svg_timeseries(rk_pts, '#66ccff', lambda v: f'{v/1000:,.0f}k', invert=True)}</div>")
+    A(f"<div class='panel'><h2 style='margin-bottom:8px'>hit accuracy</h2>"
+      f"{svg_timeseries(ac_pts, '#b3d944', lambda v: f'{v:.1f}%')}</div>")
+    A("</div></section>")
+
+    # ---- consistency
+    A("<section id='consistency'><h2>consistency "
+      "<em>unstable rate — lower means steadier tapping</em></h2>"
+      "<div class='grid g2'>")
+    A(f"<div class='panel'><h2 style='margin-bottom:8px'>UR over time "
+      f"<em>dot colour = star rating</em></h2>{svg_scatter_trend(ur_rows)}</div>")
+    A(f"<div class='panel'><h2 style='margin-bottom:8px'>UR by difficulty "
+      f"<em>median per band</em></h2>{render_star_bands(ur_rows)}</div>")
+    A("</div></section>")
+
+    dist_scores = ss or d["best_scores"]
+    A(f"<section><h2>accuracy spread "
+      f"<em>{'this session' if ss else 'across your top plays'}</em></h2>"
+      f"<div class='panel'>{render_acc_histogram(dist_scores)}</div></section>")
+
+    # ---- footer
+    ur_note = (f"UR colours are relative to your own history: "
+               f"green ≤ {ur_lo:.0f}, red ≥ {ur_hi:.0f}." if urs else "")
+    A(f"""<footer>
+      <span>{len(history) + 1} snapshots · {len(ur_rows)} replays analysed</span>
+      <span>{esc(ur_note)}</span>
+      <span>circlecore computes UR the stable way; lazer's in-game number reads lower</span>
+      <span><code>osu-report</code></span>
+    </footer></div>""")
+
+    title = f"{snap.get('username', 'osu!')} — session report"
+    return (f"<!doctype html><html lang='en'><head><meta charset='utf-8'>"
+            f"<meta name='viewport' content='width=device-width,initial-scale=1'>"
+            f"<title>{esc(title)}</title><style>{build_css(d.get('cover_uri'), d.get('cover_ratio'))}</style></head><body>"
+            + "".join(out) + f"<script>{TOOLTIP_JS}</script></body></html>")
+
+
+# Chart points carry their detail in data-tip; this puts it in a box that
+# tracks the cursor. textContent, never innerHTML — map titles are API data.
+TOOLTIP_JS = """
+(function(){
+  var tip=document.createElement('div');tip.id='tip';document.body.appendChild(tip);
+  var pad=14;
+  function place(e){
+    var r=tip.getBoundingClientRect(),x=e.clientX+pad,y=e.clientY+pad;
+    if(x+r.width>innerWidth-8)x=e.clientX-r.width-pad;
+    if(y+r.height>innerHeight-8)y=e.clientY-r.height-pad;
+    tip.style.left=Math.max(8,x)+'px';tip.style.top=Math.max(8,y)+'px';
+  }
+  function show(text,e){tip.textContent=text;tip.classList.add('on');place(e);}
+  function hide(){tip.classList.remove('on');}
+
+  // Plain hover tooltips — donut segments and anything outside a snapping
+  // chart, which drives its own tooltip below.
+  document.addEventListener('mouseover',function(e){
+    var t=e.target.closest&&e.target.closest('[data-tip]');
+    if(!t||t.closest('svg[data-cross]'))return;
+    show(t.getAttribute('data-tip'),e);
+  });
+  document.addEventListener('mousemove',function(e){
+    if(tip.classList.contains('on'))place(e);
+  });
+  document.addEventListener('mouseout',function(e){
+    var t=e.target.closest&&e.target.closest('[data-tip]');
+    if(t&&!t.closest('svg[data-cross]'))hide();
+  });
+
+  // Toolbar underline follows the section actually in view, and updates on
+  // click too — it used to be hard-coded to the first item.
+  var navs=[].slice.call(document.querySelectorAll('.tb-item[href^="#"]'));
+  var secs=navs.map(function(a){return document.querySelector(a.getAttribute('href'));});
+  if(navs.length){
+    var queued=false;
+    function syncNav(){
+      queued=false;
+      var y=scrollY+90,active=0;
+      for(var i=0;i<secs.length;i++){if(secs[i]&&secs[i].offsetTop<=y)active=i;}
+      // pin the last item once the page is scrolled to the bottom
+      if(innerHeight+scrollY>=document.body.offsetHeight-4)active=secs.length-1;
+      for(var j=0;j<navs.length;j++)navs[j].classList.toggle('on',j===active);
+    }
+    addEventListener('scroll',function(){
+      if(!queued){queued=true;requestAnimationFrame(syncNav);}
+    },{passive:true});
+    addEventListener('resize',syncNav,{passive:true});
+    navs.forEach(function(a){a.addEventListener('click',function(){
+      setTimeout(syncNav,60);
+    });});
+    syncNav();
+  }
+
+  // Nearest-point crosshair, the way Highcharts behaves: anywhere inside the
+  // plot the line locks onto the closest point by x and stays there over empty
+  // space, snapping across as another point becomes nearer. The matching
+  // series stays lit while everything else fades back.
+  document.querySelectorAll('svg[data-cross]').forEach(function(svg){
+    var line=svg.querySelector('.crosshair');
+    var pts=[].slice.call(svg.querySelectorAll('.pt'));
+    if(!pts.length)return;
+    var xs=pts.map(function(p){return +p.getAttribute('cx');});
+    var ys=pts.map(function(p){return +p.getAttribute('cy');});
+    var vb=svg.viewBox.baseVal,last=-1;
+
+    function clear(){
+      svg.classList.remove('cross-on','focus');
+      pts.forEach(function(q){q.classList.remove('lit','sel');});
+      last=-1;hide();
+    }
+    svg.addEventListener('mousemove',function(e){
+      var r=svg.getBoundingClientRect();
+      var mx=(e.clientX-r.left)/r.width*vb.width;
+      var my=(e.clientY-r.top)/r.height*vb.height;
+      var i,dx,nx=Infinity;
+      for(i=0;i<xs.length;i++){dx=Math.abs(xs[i]-mx);if(dx<nx)nx=dx;}
+      // within the nearest column, prefer the point closest vertically
+      var best=-1,bd=Infinity;
+      for(i=0;i<xs.length;i++){
+        if(Math.abs(xs[i]-mx)>nx+6)continue;
+        var dy=Math.abs(ys[i]-my);
+        if(dy<bd){bd=dy;best=i;}
+      }
+      if(best<0)return;
+      var p=pts[best];
+      if(line){line.setAttribute('x1',xs[best]);line.setAttribute('x2',xs[best]);}
+      svg.classList.add('cross-on','focus');
+      if(best!==last){
+        var s=p.dataset.series;
+        pts.forEach(function(q){
+          q.classList.toggle('lit',s?q.dataset.series===s:q===p);
+          q.classList.toggle('sel',q===p);
+        });
+        last=best;
+      }
+      show(p.getAttribute('data-tip'),e);
+    });
+    svg.addEventListener('mouseleave',clear);
+  });
+})();
+"""
+
+
+# ------------------------------------------------------- analysis export --
+
+def _miss(s):
+    st = s.get("statistics") or {}
+    return st.get("count_miss") or st.get("miss") or 0
+
+
+def _ur_of(s, ur_map):
+    e = ur_map.get(ost._score_key(s))
+    return e.get("ur") if e else None
+
+
+def band_stats(scores, value_of, bands, ur_map):
+    """
+    Aggregate scores into bands by some beatmap attribute (stars, BPM, AR...).
+
+    Returns one row per non-empty band. Every column is a plain count or mean
+    so a reader doesn't have to recompute anything to compare bands.
+    """
+    rows = []
+    for lo, hi, label in bands:
+        sel = []
+        for s in scores:
+            v = value_of(s)
+            if v is not None and lo <= v < hi:
+                sel.append(s)
+        if not sel:
+            continue
+        accs = [(s.get("accuracy") or 0) * 100 for s in sel]
+        urs = [u for u in (_ur_of(s, ur_map) for s in sel) if u]
+        misses = [_miss(s) for s in sel]
+        passed = [s for s in sel if s.get("passed")]
+        rows.append({
+            "band": label,
+            "n": len(sel),
+            "acc": mean(accs),
+            "ur": median(urs) if urs else None,
+            "ur_n": len(urs),
+            "miss": mean(misses),
+            "fc_rate": (sum(1 for s in passed if _miss(s) == 0) / len(passed) * 100
+                        if passed else None),
+            "pass_rate": len(passed) / len(sel) * 100,
+            "pp": mean([s.get("pp") or 0 for s in sel]),
+        })
+    return rows
+
+
+def md_band_table(rows, unit=""):
+    if not rows:
+        return "_no data in range_\n"
+    out = [f"| {unit or 'band'} | plays | avg acc | median UR | UR n "
+           f"| avg miss | FC% | pass% | avg pp |",
+           "|---|---:|---:|---:|---:|---:|---:|---:|---:|"]
+    for r in rows:
+        ur = f"{r['ur']:.0f}" if r["ur"] else "–"
+        fc = f"{r['fc_rate']:.0f}%" if r["fc_rate"] is not None else "–"
+        out.append(f"| {r['band']} | {r['n']} | {r['acc']:.2f}% | {ur} | "
+                   f"{r['ur_n']} | {r['miss']:.2f} | {fc} | "
+                   f"{r['pass_rate']:.0f}% | {r['pp']:.1f} |")
+    return "\n".join(out) + "\n"
+
+
+SR_BANDS = [(0, 2.5, "<2.5★"), (2.5, 3.0, "2.5–3.0★"), (3.0, 3.5, "3.0–3.5★"),
+            (3.5, 4.0, "3.5–4.0★"), (4.0, 4.5, "4.0–4.5★"), (4.5, 99, "4.5★+")]
+BPM_BANDS = [(0, 140, "<140"), (140, 160, "140–160"), (160, 180, "160–180"),
+             (180, 200, "180–200"), (200, 999, "200+")]
+AR_BANDS = [(0, 8, "<8"), (8, 8.5, "8–8.5"), (8.5, 9, "8.5–9"),
+            (9, 9.5, "9–9.5"), (9.5, 11, "9.5+")]
+OD_BANDS = [(0, 6, "<6"), (6, 7, "6–7"), (7, 8, "7–8"), (8, 9, "8–9"), (9, 11, "9+")]
+CS_BANDS = [(0, 3.5, "<3.5"), (3.5, 4, "3.5–4"), (4, 4.5, "4–4.5"), (4.5, 11, "4.5+")]
+
+
+def _bm(s, key):
+    v = (s.get("beatmap") or {}).get(key)
+    return float(v) if v is not None else None
+
+
+def linreg_slope(pairs):
+    """Least-squares slope of y over x; None when it can't be determined."""
+    pts = [(x, y) for x, y in pairs if x is not None and y is not None]
+    if len(pts) < 3:
+        return None
+    xs = [p[0] for p in pts]
+    ys = [p[1] for p in pts]
+    mx, my = mean(xs), mean(ys)
+    denom = sum((x - mx) ** 2 for x in xs)
+    if not denom:
+        return None
+    return sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / denom
+
+
+def build_brief(d):
+    """
+    A self-contained Markdown digest written for another model to reason over.
+
+    Deliberately reports measurements and sample sizes only — the judgement
+    calls are left to whoever reads it, and the caveats needed to avoid
+    misreading the numbers are stated up front.
+    """
+    snap, history = d["snap"], d["history"]
+    ur_map = d["ur_map"]
+    deep = d.get("best_all") or d["best_scores"]
+    recent = d["session_scores"]
+    analysis = deep + [s for s in recent if s not in deep]
+    urs_all = [r["ur"] for r in d["ur_rows"] if r.get("ur")]
+
+    L = []
+    A = L.append
+
+    A(f"# osu! skill profile — {snap.get('username')}")
+    A("")
+    A(f"Generated {datetime.now().astimezone():%Y-%m-%d %H:%M %Z} by `osu-report`. "
+      f"Game mode: osu!standard (lazer client).")
+    A("")
+    A("## How to read this")
+    A("")
+    A("- **UR** (unstable rate) is the standard deviation of hit timing error "
+      "×10. Lower is steadier. It is computed locally from replay files by "
+      "circlecore using the *stable* algorithm. **lazer's in-game UR reads "
+      "roughly 15–20% lower** for the same play because it judges slider heads "
+      "differently, so do not compare these numbers to what the client shows.")
+    A("- **pp** is osu!'s performance-points ranking metric. Only a player's "
+      "top ~100 plays contribute, with exponentially decaying weight.")
+    A("- **AR** = approach rate (reading speed), **OD** = overall difficulty "
+      "(timing-window strictness), **CS** = circle size, **HP** = drain rate. "
+      "Higher AR means objects appear later and travel faster.")
+    A("- **FC** = full combo (no misses). **pass%** = fraction not failed out of.")
+    A("- Band tables aggregate every available score. Trust rows with a larger "
+      "`plays` count; single-digit samples are noise.")
+    A("")
+
+    # ---- current state
+    A("## Current state")
+    A("")
+    A(f"| metric | value |")
+    A("|---|---|")
+    A(f"| pp | {snap['pp']:,.0f} |")
+    A(f"| global rank | #{snap['global_rank']:,} |")
+    A(f"| country rank | #{snap['country_rank']:,} |")
+    A(f"| hit accuracy (profile) | {snap['accuracy']:.2f}% |")
+    A(f"| play count | {snap['play_count']:,} |")
+    A(f"| play time | {fmt_dur(snap.get('play_time'))} |")
+    A(f"| level | {snap.get('level')} ({snap.get('level_progress')}%) |")
+    A(f"| ranked grades | SS {snap.get('ss')} · S {snap.get('s')} · A {snap.get('a')} |")
+    A(f"| max combo (all time) | {snap.get('max_combo')} |")
+    A("")
+
+    # ---- trend
+    if history:
+        first = history[0]
+        t0, t1 = parse_iso(first["timestamp"]), parse_iso(snap["timestamp"])
+        days = max((t1 - t0).total_seconds() / 86400, 1e-9) if t0 and t1 else None
+        A("## Trend over the recorded window")
+        A("")
+        A(f"Tracking covers {len(history) + 1} snapshots from "
+          f"{local(t0):%Y-%m-%d} to {local(t1):%Y-%m-%d} "
+          f"({days:.1f} days).")
+        A("")
+        A("| metric | start | now | change | per day |")
+        A("|---|---:|---:|---:|---:|")
+
+        def trow(label, k, fmt="{:,.2f}", invert=False):
+            a, b = first.get(k), snap.get(k)
+            if a is None or b is None:
+                return
+            delta = b - a
+            A(f"| {label} | {fmt.format(a)} | {fmt.format(b)} | "
+              f"{'+' if delta >= 0 else ''}{fmt.format(delta)} | "
+              f"{'+' if delta >= 0 else ''}{fmt.format(delta / days)} |")
+
+        trow("pp", "pp")
+        trow("global rank", "global_rank", "{:,.0f}")
+        trow("hit accuracy", "accuracy")
+        trow("play count", "play_count", "{:,.0f}")
+        A("")
+
+    # ---- session
+    if recent:
+        accs = [(s.get("accuracy") or 0) * 100 for s in recent]
+        passed = sum(1 for s in recent if s.get("passed"))
+        s_urs = [u for u in (_ur_of(s, ur_map) for s in recent) if u]
+        stars = [_bm(s, "difficulty_rating") for s in recent]
+        stars = [s for s in stars if s]
+        A(f"## Most recent session ({d['hours']}h window)")
+        A("")
+        A(f"- {len(recent)} scores submitted, {passed} passed, {len(recent) - passed} failed")
+        A(f"- accuracy: mean {mean(accs):.2f}%, best {max(accs):.2f}%, worst {min(accs):.2f}%")
+        if stars:
+            A(f"- difficulty played: mean {mean(stars):.2f}★, hardest {max(stars):.2f}★")
+        if s_urs:
+            A(f"- UR: median {median(s_urs):.0f}, best {min(s_urs):.0f} "
+              f"(from {len(s_urs)} replays)")
+        A(f"- new personal bests set: {len(d['new_pbs'])}")
+        A("")
+
+    # ---- the skill breakdowns
+    A("## Performance by beatmap attribute")
+    A("")
+    A(f"Sample: {len(analysis)} scores (top plays plus the recent session). "
+      f"UR columns draw on {len(urs_all)} stored replays overall.")
+    A("")
+    for title, bands, getter, unit in (
+        ("By star rating", SR_BANDS, lambda s: _bm(s, "difficulty_rating"), "stars"),
+        ("By BPM", BPM_BANDS, lambda s: _bm(s, "bpm"), "bpm"),
+        ("By approach rate (AR)", AR_BANDS, lambda s: _bm(s, "ar"), "AR"),
+        ("By overall difficulty (OD)", OD_BANDS, lambda s: _bm(s, "accuracy"), "OD"),
+        ("By circle size (CS)", CS_BANDS, lambda s: _bm(s, "cs"), "CS"),
+    ):
+        A(f"### {title}")
+        A("")
+        A(md_band_table(band_stats(analysis, getter, bands, ur_map), unit))
+        A("")
+
+    # ---- correlations
+    A("## Correlations")
+    A("")
+    A("Least-squares slopes across the sample. These are descriptive, not "
+      "causal, and are sensitive to the uneven spread of maps played.")
+    A("")
+    pairs = [
+        ("accuracy vs star rating", "% per ★",
+         [(_bm(s, "difficulty_rating"), (s.get("accuracy") or 0) * 100) for s in analysis]),
+        ("accuracy vs BPM", "% per BPM",
+         [(_bm(s, "bpm"), (s.get("accuracy") or 0) * 100) for s in analysis]),
+        ("accuracy vs AR", "% per AR",
+         [(_bm(s, "ar"), (s.get("accuracy") or 0) * 100) for s in analysis]),
+        ("UR vs star rating", "UR per ★",
+         [(_bm(s, "difficulty_rating"), _ur_of(s, ur_map)) for s in analysis]),
+        ("UR vs BPM", "UR per BPM",
+         [(_bm(s, "bpm"), _ur_of(s, ur_map)) for s in analysis]),
+        ("misses vs star rating", "misses per ★",
+         [(_bm(s, "difficulty_rating"), _miss(s)) for s in analysis]),
+    ]
+    A("| relationship | slope | unit |")
+    A("|---|---:|---|")
+    for label, unit, data in pairs:
+        sl = linreg_slope(data)
+        A(f"| {label} | {f'{sl:+.2f}' if sl is not None else '–'} | {unit} |")
+    A("")
+
+    # ---- mods
+    A("## Mod usage")
+    A("")
+    counts = {}
+    for s in analysis:
+        key = "".join(mods_of(s)) or "NM"
+        c = counts.setdefault(key, {"n": 0, "acc": [], "pp": []})
+        c["n"] += 1
+        c["acc"].append((s.get("accuracy") or 0) * 100)
+        c["pp"].append(s.get("pp") or 0)
+    A("| mods | plays | avg acc | avg pp |")
+    A("|---|---:|---:|---:|")
+    for k, c in sorted(counts.items(), key=lambda kv: -kv[1]["n"]):
+        A(f"| {k} | {c['n']} | {mean(c['acc']):.2f}% | {mean(c['pp']):.1f} |")
+    A("")
+
+    # ---- top plays
+    A("## Top plays (pp-ranked)")
+    A("")
+    A("| # | pp | weight | stars | BPM | AR | OD | acc | UR | miss | mods | map |")
+    A("|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---|")
+    for i, s in enumerate(deep[:25], 1):
+        bms = s.get("beatmapset") or {}
+        bm = s.get("beatmap") or {}
+        u = _ur_of(s, ur_map)
+        w = (s.get("weight") or {}).get("percentage")
+        A(f"| {i} | {(s.get('pp') or 0):.0f} | "
+          f"{f'{w:.0f}%' if w is not None else '–'} | "
+          f"{bm.get('difficulty_rating') or 0:.2f} | {bm.get('bpm') or '–'} | "
+          f"{bm.get('ar') or '–'} | {bm.get('accuracy') or '–'} | "
+          f"{(s.get('accuracy') or 0) * 100:.2f}% | {f'{u:.0f}' if u else '–'} | "
+          f"{_miss(s)} | {''.join(mods_of(s)) or 'NM'} | "
+          f"{bms.get('title', '?')} [{bm.get('version', '')}] |")
+    A("")
+
+    # ---- consistency
+    if urs_all:
+        A("## Tapping consistency (UR)")
+        A("")
+        A(f"- samples: {len(urs_all)} replays")
+        A(f"- best {min(urs_all):.0f} · 25th pct {percentile(urs_all, .25):.0f} · "
+          f"median {median(urs_all):.0f} · 75th pct {percentile(urs_all, .75):.0f} · "
+          f"worst {max(urs_all):.0f}")
+        rows = sorted([r for r in d["ur_rows"] if r.get("ur") and r.get("played_at")],
+                      key=lambda r: r["played_at"])
+        if len(rows) >= 8:
+            half = len(rows) // 2
+            early = median([r["ur"] for r in rows[:half]])
+            late = median([r["ur"] for r in rows[half:]])
+            A(f"- earlier half median {early:.0f} → later half median {late:.0f} "
+              f"({late - early:+.0f})")
+        A("")
+
+    # ---- accuracy distribution
+    accs = [(s.get("accuracy") or 0) * 100 for s in analysis]
+    if accs:
+        A("## Accuracy distribution across the sample")
+        A("")
+        A("| range | plays |")
+        A("|---|---:|")
+        for lo, hi, lab in [(0, 70, "<70%"), (70, 80, "70–80%"), (80, 85, "80–85%"),
+                            (85, 90, "85–90%"), (90, 95, "90–95%"), (95, 101, "95%+")]:
+            A(f"| {lab} | {sum(1 for a in accs if lo <= a < hi)} |")
+        A("")
+
+    # ---- caveats
+    A("## Data caveats")
+    A("")
+    A("- UR is only available for scores whose replay is stored. osu! keeps "
+      "**one replay per map per player** (the personal best), so non-PB scores "
+      "have no UR and are absent from UR columns.")
+    A("- The score sample is biased toward the player's **best** plays, because "
+      "the top-100 list dominates it. Failed and mediocre attempts appear only "
+      "if they fall inside the recent-session window.")
+    A("- Unranked / loved / graveyard maps are missing UR: the beatmap files "
+      "are fetched through the legacy API, which only serves ranked and "
+      "approved maps.")
+    A("- Profile `hit accuracy` is osu!'s own weighted figure over top plays "
+      "and will not equal the mean of the accuracy column here.")
+    A("- Star rating shown is the **nomod** value; it does not account for "
+      "rate-changing mods applied on the play.")
+    A("")
+    return "\n".join(L) + "\n"
+
+
+# --------------------------------------------------- terminal presentation --
+
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+USE_COLOR = True
+
+
+def vlen(s):
+    """Printed width, ignoring escapes and counting wide glyphs as two cells."""
+    s = ANSI_RE.sub("", s)
+    w = 0
+    for ch in s:
+        if unicodedata.combining(ch):
+            continue
+        w += 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+    return w
+
+
+def trunc(s, width):
+    """Cut to a printed width, accounting for wide glyphs."""
+    if vlen(s) <= width:
+        return s
+    out, w = "", 0
+    for ch in s:
+        cw = 0 if unicodedata.combining(ch) else \
+             (2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1)
+        if w + cw > width - 1:
+            return out + "…"
+        out += ch
+        w += cw
+    return out
+
+
+def pad(s, width, align="<"):
+    gap = max(0, width - vlen(s))
+    if align == ">":
+        return " " * gap + s
+    if align == "^":
+        left = gap // 2
+        return " " * left + s + " " * (gap - left)
+    return s + " " * gap
+
+
+def rgb(hex_color):
+    c = hex_color.lstrip("#")
+    return int(c[0:2], 16), int(c[2:4], 16), int(c[4:6], 16)
+
+
+def fg(s, hex_color, bold=False):
+    if not USE_COLOR:
+        return s
+    r, g, b = rgb(hex_color)
+    return f"\033[{'1;' if bold else ''}38;2;{r};{g};{b}m{s}\033[0m"
+
+
+def chip(s, hex_bg, bold=True):
+    """A pill: coloured background, auto-contrasting text — the SR/grade badges."""
+    if not USE_COLOR:
+        return s
+    r, g, b = rgb(hex_bg)
+    tr, tg, tb = rgb(readable_on(hex_bg))
+    return f"\033[{'1;' if bold else ''}38;2;{tr};{tg};{tb};48;2;{r};{g};{b}m{s}\033[0m"
+
+
+def dim(s):
+    return f"\033[2m{s}\033[0m" if USE_COLOR else s
+
+
+# braille cell: 2 dots wide, 4 tall -> 8x the resolution of a block character
+DOT = [[0x01, 0x08], [0x02, 0x10], [0x04, 0x20], [0x40, 0x80]]
+
+
+def braille_chart(points, cols, rows, color, invert=False,
+                  yfmt=lambda v: f"{v:,.0f}"):
+    """A line chart drawn in braille, with the axis labels down the left."""
+    pts = [(t, v) for t, v in points if t is not None and v is not None]
+    if len(pts) < 2:
+        return [dim("      not enough data yet")]
+    pts.sort(key=lambda p: p[0])
+    vals = [v for _, v in pts]
+    lo, hi = min(vals), max(vals)
+    if hi == lo:
+        hi = lo + 1
+
+    W, H = cols * 2, rows * 4
+    grid = [[0] * cols for _ in range(rows)]
+    t0 = pts[0][0]
+    span = (pts[-1][0] - t0).total_seconds() or 1
+
+    def to_dot(t, v):
+        x = int((t - t0).total_seconds() / span * (W - 1))
+        f = (v - lo) / (hi - lo)
+        if invert:
+            f = 1 - f
+        return x, int((1 - f) * (H - 1))
+
+    def plot(x, y):
+        if 0 <= x < W and 0 <= y < H:
+            grid[y // 4][x // 2] |= DOT[y % 4][x % 2]
+
+    prev = None
+    for t, v in pts:
+        x, y = to_dot(t, v)
+        if prev:                                   # Bresenham between samples
+            x0, y0 = prev
+            dx, dy = abs(x - x0), -abs(y - y0)
+            sx, sy = (1 if x0 < x else -1), (1 if y0 < y else -1)
+            err = dx + dy
+            while True:
+                plot(x0, y0)
+                if x0 == x and y0 == y:
+                    break
+                e2 = 2 * err
+                if e2 >= dy:
+                    err += dy
+                    x0 += sx
+                if e2 <= dx:
+                    err += dx
+                    y0 += sy
+        plot(x, y)
+        prev = (x, y)
+
+    top, bottom = (lo, hi) if invert else (hi, lo)
+    out = []
+    for r, line in enumerate(grid):
+        label = ""
+        if r == 0:
+            label = yfmt(top)
+        elif r == rows - 1:
+            label = yfmt(bottom)
+        body = "".join(chr(0x2800 + c) for c in line)
+        out.append(dim(pad(label, 7, ">")) + " " + fg(body, color))
+
+    span_lbl = (f"{local(pts[0][0]).strftime('%d %b')}"
+                f" → {local(pts[-1][0]).strftime('%d %b')}")
+    out.append(" " * 8 + dim(span_lbl))
+    return out
+
+
+def term_rule(title, width, color="#ff66ab"):
+    head = fg("━━ ", "#6f5f78") + fg(title, color, bold=True) + " "
+    return head + fg("━" * max(0, width - vlen(head)), "#6f5f78")
+
+
+def term_delta(new, old, fmt=None, invert=False):
+    if new is None or old is None:
+        return ""
+    fmt = fmt or (lambda v: f"{v:,.0f}")
+    d = new - old
+    if not round(d, 4):
+        return dim("·")
+    good = (d < 0) if invert else (d > 0)
+    return fg(("▲ " if d > 0 else "▼ ") + fmt(abs(d)),
+              "#b3d944" if good else "#ff6666")
+
+
+def term_play_table(scores, ur_map, ur_lo, ur_hi, width, empty):
+    if not scores:
+        return ["  " + dim(empty)]
+
+    # one column spec, used to build both the header and the rows, so they
+    # cannot drift apart
+    W_IDX, W_SR, W_MOD, W_GR = 4, 5, 5, 3
+    W_ACC, W_PP, W_UR, W_FC, W_AGO = 8, 6, 6, 5, 9
+    fixed = (W_IDX + 1 + W_SR + 2 + 2 + W_MOD + 1 + W_GR + 2
+             + W_ACC + W_PP + W_UR + W_FC + 1 + W_AGO)
+    title_w = max(20, width - fixed)
+
+    out = [dim(pad("#", W_IDX, ">") + " " + pad("★", W_SR) + "  "
+               + pad("map", title_w) + "  " + pad("mods", W_MOD) + " "
+               + pad("gr", W_GR) + "  "
+               + pad("acc", W_ACC, ">") + pad("pp", W_PP, ">")
+               + pad("UR", W_UR, ">") + pad("", W_FC, ">"))]
+
+    for i, s in enumerate(scores, 1):
+        bm = s.get("beatmap") or {}
+        bms = s.get("beatmapset") or {}
+        st = s.get("statistics") or {}
+        sr = bm.get("difficulty_rating") or 0
+        sc = star_color(sr)
+        acc = (s.get("accuracy") or 0) * 100
+        pp = s.get("pp") or 0
+        grade = grade_of(s)
+        gc = GRADE_COLORS.get(grade, "#8b7f92")
+        miss = st.get("miss") or st.get("count_miss") or 0
+        mods = mods_of(s)
+        when = parse_iso(s.get("ended_at") or s.get("created_at"))
+
+        e = ur_map.get(ost._score_key(s))
+        if e and e.get("ur"):
+            u = e["ur"]
+            uc = "#b3d944" if u <= ur_lo else "#ff6666" if u >= ur_hi else "#ffcc22"
+            ur_cell = fg(pad(f"{u:.0f}", W_UR, ">"), uc, bold=True)
+        else:
+            ur_cell = dim(pad("–", W_UR, ">"))
+
+        # difficulty name rides alongside the title instead of on its own line
+        diff = bm.get("version", "")
+        dtxt = f" [{diff}]" if diff else ""
+        if vlen(dtxt) > title_w * 0.45:
+            dtxt = trunc(dtxt, int(title_w * 0.45))
+        title = trunc(bms.get("title", "?"), title_w - vlen(dtxt))
+        label = title + dim(dtxt) + " " * (title_w - vlen(title) - vlen(dtxt))
+
+        mod_txt = "".join(mods) or "NM"
+        mod_cell = (fg(pad(mod_txt, W_MOD), "#ff8f8f") if mods
+                    else dim(pad("NM", W_MOD)))
+
+        out.append(
+            dim(pad(str(i), W_IDX, ">")) + " " +
+            chip(f"★{sr:.2f}", sc) + "  " +
+            label + "  " +
+            mod_cell + " " +
+            chip(f"{GRADE_LABELS.get(grade, grade[0]):^{W_GR}}", gc) + "  " +
+            fg(pad(f"{acc:.2f}%", W_ACC, ">"), "#ffffff") +
+            fg(pad(f"{pp:.0f}", W_PP, ">"), "#ff66ab", bold=True) +
+            ur_cell +
+            (fg(pad(f"{miss}✕", W_FC, ">"), "#ff6666") if miss
+             else fg(pad("FC", W_FC, ">"), "#b3d944")) +
+            dim(f" {fmt_ago(when)}")
+        )
+    return out
+
+
+def gradient_bar(frac, cells, hex_color):
+    """
+    Horizontal bar that ramps up to the band's colour.
+
+    The floor stays high enough that a short bar still reads as filled, and
+    the empty track is darker than the darkest fill so the two never blur.
+    """
+    n = max(1, int(round(frac * cells)))
+    r, g, b = rgb(hex_color)
+    out = []
+    for i in range(n):
+        t = 0.55 + 0.45 * (i / max(1, n - 1))
+        out.append(fg("█", f"#{int(r*t):02x}{int(g*t):02x}{int(b*t):02x}"))
+    return "".join(out) + fg("░" * (cells - n), "#332d3a")
+
+
+def render_terminal(d):
+    """The whole report as ANSI text — same data, no browser."""
+    snap, history = d["snap"], d["history"]
+    base = d["session_start"] or d["prev"]
+    W = max(84, min(shutil.get_terminal_size((100, 40)).columns - 2, 118))
+    L = []
+
+    # ---- header
+    name = snap.get("username") or "osu!"
+    L.append("")
+    L.append(fg("  " + name, "#ff66ab", bold=True) + "   " +
+             dim(f"global #{snap['global_rank']:,}   country #{snap['country_rank']:,}"))
+    lvl = snap.get("level_progress") or 0
+    L.append("  " + dim(f"LV {snap.get('level') or '–'} ") +
+             gradient_bar(lvl / 100, 18, "#ffcc22") + dim(f" {lvl}%") +
+             "   " + fg(f"SS {snap.get('ss') or 0}", "#ffd966") +
+             "  " + fg(f"S {snap.get('s') or 0}", "#e8eef5") +
+             "  " + fg(f"A {snap.get('a') or 0}", "#b3d944"))
+    L.append("")
+
+    # ---- headline numbers
+    cells = [
+        ("performance", fg(f"{snap['pp']:,.0f}pp", "#ff66ab", bold=True),
+         term_delta(snap["pp"], base and base.get("pp"), lambda v: f"{v:,.1f}")),
+        ("global", fg(f"#{snap['global_rank']:,}", "#66ccff", bold=True),
+         term_delta(snap["global_rank"], base and base.get("global_rank"),
+                    invert=True)),
+        ("accuracy", fg(f"{snap['accuracy']:.2f}%", "#ffffff", bold=True),
+         term_delta(snap["accuracy"], base and base.get("accuracy"),
+                    lambda v: f"{v:.2f}%")),
+        ("plays", fg(f"{snap['play_count']:,}", "#ffffff", bold=True),
+         term_delta(snap["play_count"], base and base.get("play_count"))),
+        ("playtime", fg(fmt_dur(snap.get("play_time")), "#ffffff", bold=True),
+         term_delta(snap.get("play_time"), base and base.get("play_time"), fmt_dur)),
+    ]
+    cw = W // len(cells)
+    L.append("  " + "".join(pad(dim(k), cw) for k, _, _ in cells))
+    L.append("  " + "".join(pad(v, cw) for _, v, _ in cells))
+    L.append("  " + "".join(pad(delta, cw) for _, _, delta in cells))
+    L.append("")
+
+    urs = [r["ur"] for r in d["ur_rows"] if r.get("ur")]
+    ur_lo = percentile(urs, 0.25) if urs else 0
+    ur_hi = percentile(urs, 0.75) if urs else 0
+
+    # ---- session
+    ss = d["session_scores"]
+    L.append(term_rule(f"this session · {d['hours']}h window", W))
+    L.append("")
+    if ss:
+        accs = [(s.get("accuracy") or 0) * 100 for s in ss]
+        stars = [(s.get("beatmap") or {}).get("difficulty_rating")
+                 for s in ss if (s.get("beatmap") or {}).get("difficulty_rating")]
+        passed = sum(1 for s in ss if s.get("passed"))
+        s_urs = [d["ur_map"][ost._score_key(s)]["ur"] for s in ss
+                 if ost._score_key(s) in d["ur_map"]
+                 and d["ur_map"][ost._score_key(s)].get("ur")]
+        bits = [f"{len(ss)} plays", f"{passed} passed", f"{mean(accs):.2f}% avg acc"]
+        if stars:
+            bits.append(f"{mean(stars):.2f}★ avg  (max {max(stars):.2f}★)")
+        if s_urs:
+            bits.append(f"median UR {median(s_urs):.0f}")
+        if base:
+            bits.append(f"{snap['pp'] - base['pp']:+.1f}pp")
+        L.append("  " + dim(" · ").join(fg(b, "#ffffff") for b in bits))
+        L.append("  " + dim(f"{len(d['new_pbs'])} new personal best"
+                            f"{'s' if len(d['new_pbs']) != 1 else ''} this session"))
+    else:
+        L.append("  " + dim(f"no scores submitted in the last {d['hours']}h"))
+    L.append("")
+
+    # ---- tables
+    L.append(term_rule(f"best {len(d['session_top'])} this session", W))
+    L.append("")
+    L += term_play_table(d["session_top"], d["ur_map"], ur_lo, ur_hi, W,
+                         f"no passed scores in the last {d['hours']}h")
+    L.append("")
+    L.append(term_rule(f"all-time top {len(d['best_scores'])}", W))
+    L.append("")
+    L += term_play_table(d["best_scores"], d["ur_map"], ur_lo, ur_hi, W,
+                         "no top plays returned")
+    L.append("")
+
+    # ---- progress
+    hist = history + [snap]
+    cw = min(92, W - 14)
+    L.append(term_rule("progress", W))
+    for label, key, color, inv, f in (
+        ("performance points", "pp", "#ff66ab", False, lambda v: f"{v:,.0f}"),
+        ("global rank  (up = climbing)", "global_rank", "#66ccff", True,
+         lambda v: f"{v/1000:,.0f}k"),
+        ("hit accuracy", "accuracy", "#b3d944", False, lambda v: f"{v:.2f}%"),
+    ):
+        L.append("")
+        L.append("  " + fg(label, "#ffffff"))
+        L += braille_chart([(parse_iso(h["timestamp"]), h.get(key)) for h in hist],
+                           cw, 6, color, invert=inv, yfmt=f)
+    L.append("")
+
+    # ---- consistency
+    L.append(term_rule("consistency · unstable rate, lower is steadier", W))
+    L.append("")
+    ur_rows = d["ur_rows"]
+    L.append("  " + fg("UR over time", "#ffffff"))
+    L += braille_chart([(parse_iso(r.get("played_at")), r.get("ur")) for r in ur_rows],
+                       cw, 6, "#ffcc22")
+    L.append("")
+    L.append("  " + fg("UR by difficulty", "#ffffff") + dim("   median per band"))
+    bands = []
+    for lo, hi, label in STAR_BANDS:
+        v = [r["ur"] for r in ur_rows if r.get("ur") and lo <= (r.get("stars") or 0) < hi]
+        if v:
+            bands.append((label, lo, hi, v))
+    if bands:
+        top = max(max(v) for _, _, _, v in bands)
+        for label, lo, hi, v in bands:
+            med = median(v)
+            color = star_color((lo + min(hi, lo + 1)) / 2)
+            L.append("  " + pad(dim(label), 14) +
+                     gradient_bar(med / top, 34, color) +
+                     fg(f" {med:.0f} UR", "#ffffff", bold=True) +
+                     dim(f"   {len(v)} play{'s' if len(v) != 1 else ''}"))
+    else:
+        L.append("  " + dim("no replay data yet"))
+    L.append("")
+
+    # ---- accuracy spread
+    dist = ss or d["best_scores"]
+    accs = [(s.get("accuracy") or 0) * 100 for s in dist]
+    if len(accs) >= 3:
+        L.append(term_rule("accuracy spread · "
+                           + ("this session" if ss else "top plays"), W))
+        L.append("")
+        edges = [(0, 70, "<70"), (70, 80, "70-80"), (80, 85, "80-85"),
+                 (85, 90, "85-90"), (90, 95, "90-95"), (95, 101, "95+")]
+        counts = [(lab, sum(1 for a in accs if lo <= a < hi)) for lo, hi, lab in edges]
+        peak = max(c for _, c in counts) or 1
+        for lab, c in counts:
+            L.append("  " + pad(dim(lab), 8) +
+                     gradient_bar(c / peak, 34, "#ff66ab") +
+                     fg(f" {c}", "#ffffff", bold=True))
+        L.append("")
+
+    note = (f"UR colours are relative to your own history: "
+            f"green ≤ {ur_lo:.0f}, red ≥ {ur_hi:.0f}" if urs else "")
+    L.append(dim(f"  {len(history) + 1} snapshots · {len(ur_rows)} replays analysed"))
+    if note:
+        L.append(dim(f"  {note}"))
+    L.append(dim("  circlecore computes UR the stable way; lazer's own number reads lower"))
+    L.append("")
+    return "\n".join(L)
+
+
+def show_sixel(html_path):
+    """
+    Pixel-for-pixel the browser report, drawn inline as sixel graphics.
+    Needs a headless render first, so it costs a few seconds.
+    """
+    if not shutil.which("chafa"):
+        return False, "chafa is not installed"
+    png = html_path.with_suffix(".png")
+    ff = shutil.which("firefox")
+    if not ff:
+        return False, "firefox is needed to rasterise the page"
+    # throwaway profile: a persistent one accumulates caches worth megabytes
+    # for what is a one-shot render
+    prof = tempfile.mkdtemp(prefix="osu-report-ff")
+    try:
+        subprocess.run([ff, "--headless", "--profile", prof, "--no-remote",
+                        "--screenshot", str(png), html_path.as_uri()],
+                       check=True, timeout=180,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except (subprocess.SubprocessError, OSError) as e:
+        return False, f"headless render failed: {e}"
+    finally:
+        shutil.rmtree(prof, ignore_errors=True)
+    if not png.exists():
+        return False, "headless render produced no image"
+    cols = shutil.get_terminal_size((100, 40)).columns - 2
+    subprocess.run(["chafa", "--format=sixel", f"--size={cols}x",
+                    "--animate=off", str(png)], check=False)
+    png.unlink(missing_ok=True)
+    return True, None
+
+
+# --------------------------------------------------------------------- data --
+
+IMG_CACHE = DATA_DIR / "images"
+
+
+def image_size(raw):
+    """
+    (width, height) straight from the file header — PNG and JPEG only.
+
+    Knowing the true aspect ratio lets the banner be sized to match the
+    artwork, so nothing gets cropped, without embedding the image a second
+    time as an <img> just to read its intrinsic size.
+    """
+    try:
+        if raw[:8] == b"\x89PNG\r\n\x1a\n":
+            return (int.from_bytes(raw[16:20], "big"),
+                    int.from_bytes(raw[20:24], "big"))
+        if raw[:2] == b"\xff\xd8":                       # JPEG: walk the markers
+            i, n = 2, len(raw)
+            while i < n - 9:
+                if raw[i] != 0xFF:
+                    i += 1
+                    continue
+                m = raw[i + 1]
+                if m in (0xD8, 0xD9) or 0xD0 <= m <= 0xD7:
+                    i += 2
+                    continue
+                seg = int.from_bytes(raw[i + 2:i + 4], "big")
+                if m in (0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6,
+                         0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF):
+                    return (int.from_bytes(raw[i + 7:i + 9], "big"),
+                            int.from_bytes(raw[i + 5:i + 7], "big"))
+                i += 2 + seg
+    except Exception:
+        pass
+    return None
+
+
+def optimise_image(raw, ctype, max_w=1600, quality=84, floor=220_000):
+    """
+    Re-encode an oversized cover to JPEG so it doesn't dominate the report.
+
+    A 2000x500 PNG cover can be ~1 MB, which is 1.3 MB of base64 in every
+    report — far more than the entire rest of the page. The banner renders
+    ~1200px wide and the page backdrop is blurred at 30px, so neither needs
+    the original resolution. Pillow is optional: without it, or if re-encoding
+    somehow grows the file, the original bytes are kept.
+    """
+    if len(raw) <= floor:
+        return raw, ctype
+    try:
+        import io
+        from PIL import Image
+    except ImportError:
+        return raw, ctype
+    try:
+        im = Image.open(io.BytesIO(raw))
+        im = im.convert("RGB")
+        if im.width > max_w:
+            im = im.resize((max_w, round(im.height * max_w / im.width)),
+                           Image.LANCZOS)
+        buf = io.BytesIO()
+        im.save(buf, "JPEG", quality=quality, optimize=True, progressive=True)
+        out = buf.getvalue()
+    except Exception:
+        return raw, ctype
+    return (out, "image/jpeg") if len(out) < len(raw) else (raw, ctype)
+
+
+def fetch_image(url, limit=3_000_000):
+    """
+    Remote image as (data URI, width, height), cached on disk by URL.
+
+    The cover is unchanged between runs, so re-downloading it every session is
+    pure waste; the cache also means a report still builds with its artwork
+    when the network is down.
+    """
+    if not url:
+        return None, None, None
+    key = hashlib.sha1(url.encode()).hexdigest()[:16] + "-v2"
+    IMG_CACHE.mkdir(parents=True, exist_ok=True)
+    cached = IMG_CACHE / key
+
+    if cached.exists():
+        try:
+            head, _, b64 = cached.read_text().partition("\n\n")
+            ctype, dims = head.split("\n")
+            w, h = (int(x) for x in dims.split("x"))
+            return f"data:{ctype};base64,{b64}", w or None, h or None
+        except (OSError, ValueError):
+            pass
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "osu-report"})
+        with urllib.request.urlopen(req, timeout=20) as r:
+            raw = r.read(limit)
+            ctype = r.headers.get("Content-Type", "image/png").split(";")[0]
+    except Exception:
+        return None, None, None
+
+    # measure before re-encoding: the ratio must describe the artwork, and
+    # resizing preserves it anyway
+    size = image_size(raw) or (0, 0)
+    raw, ctype = optimise_image(raw, ctype)
+    b64 = base64.b64encode(raw).decode()
+    try:
+        cached.write_text(f"{ctype}\n{size[0]}x{size[1]}\n\n{b64}")
+    except OSError:
+        pass
+    return f"data:{ctype};base64,{b64}", size[0] or None, size[1] or None
+
+
+def prune_image_cache(keep=6):
+    """Covers change; stale entries shouldn't pile up."""
+    if not IMG_CACHE.is_dir():
+        return
+    files = sorted(IMG_CACHE.iterdir(), key=lambda p: p.stat().st_mtime)
+    for f in files[:-keep]:
+        try:
+            f.unlink()
+        except OSError:
+            pass
+
+
+def fetch_avatar(url):
+    return fetch_image(url, limit=700_000)[0]
+
+
+def gather(args):
+    cfg = ost.load_config()
+    history = ost.load_jsonl(ost.HISTORY_PATH)
+    ur_map = {e["key"]: e for e in ost.load_jsonl(ost.SCORE_UR_LOG)}
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=args.hours)
+
+    if args.offline:
+        if not history:
+            sys.exit("No history recorded yet — run once with network access first.")
+        snap = history[-1]
+        history = history[:-1]
+        best_all = []
+        hits = {}
+        cover = cover_ratio = None
+        best_scores, session_scores, session_top, avatar = [], [], [], None
+    else:
+        token = ost.get_token(cfg)
+        snap = ost.take_snapshot(token, cfg)
+
+        user = {}
+        try:
+            user = ost.api_get(token, f"/users/{snap['user_id']}/{cfg['mode']}")
+        except Exception:
+            pass
+        avatar = fetch_avatar(user.get("avatar_url")) if user else None
+        cover, cw, ch = fetch_image((user.get("cover") or {}).get("url")
+                                    or user.get("cover_url")) if user else (None, None, None)
+        cover_ratio = f"{cw}/{ch}" if cw and ch else None
+        prune_image_cache()
+        ust = (user.get("statistics") or {}) if user else {}
+        hits = {k: ust.get(k) for k in
+                ("count_300", "count_100", "count_50", "count_miss", "total_hits")}
+
+        # one call gets the deep sample; the visual report still shows args.top,
+        # but the analysis export gets a far better base to reason over
+        try:
+            best_all = ost.api_get(token, f"/users/{snap['user_id']}/scores/best",
+                                   {"limit": 100, "mode": cfg["mode"]})
+        except urllib.error.HTTPError:
+            best_all = []
+        best_scores = best_all[:args.top]
+
+        try:
+            recent = ost.api_get(token, f"/users/{snap['user_id']}/scores/recent",
+                                 {"limit": 100, "include_fails": 1, "mode": cfg["mode"]})
+        except urllib.error.HTTPError:
+            recent = []
+        session_scores = [s for s in recent
+                          if (parse_iso(s.get("ended_at") or s.get("created_at")) or cutoff) >= cutoff]
+        session_top = sorted([s for s in session_scores if s.get("passed")],
+                             key=lambda s: -(s.get("pp") or 0))[:args.session_top]
+
+        if not args.fast:
+            need = [s for s in best_scores + session_top
+                    if ost._score_key(s) not in ur_map]
+            if need:
+                print(f"  fetching {len(need)} replay(s)…", flush=True)
+                rows, err = ost.fetch_score_urs(cfg, need, "score", quiet=True)
+                if err:
+                    print(f"  {err}", file=sys.stderr)
+                for r in rows:
+                    ur_map[r["key"]] = r
+
+    prev = history[-1] if history else None
+    session_start = None
+    for h in history:
+        if (parse_iso(h.get("timestamp")) or cutoff) <= cutoff:
+            session_start = h
+    session_start = session_start or (history[0] if history else None)
+
+    # personal bests whose timestamp lands inside the session window
+    new_pbs = [s for s in best_all
+               if (parse_iso(s.get("ended_at") or s.get("created_at")) or cutoff) >= cutoff]
+
+    return {
+        "cfg": cfg, "snap": snap, "prev": prev, "history": history,
+        "session_start": session_start, "hours": args.hours,
+        "best_scores": best_scores, "best_all": best_all,
+        "session_scores": session_scores,
+        "session_top": session_top, "new_pbs": new_pbs,
+        "ur_map": ur_map, "ur_rows": list(ur_map.values()),
+        "avatar_uri": avatar, "cover_uri": cover,
+        "cover_ratio": cover_ratio, "hits": hits,
+    }
+
+
+def save_snapshot(snap, history):
+    """Append only when something actually moved — history stays readable."""
+    if history:
+        last = history[-1]
+        if (last.get("pp") == snap.get("pp")
+                and last.get("play_count") == snap.get("play_count")):
+            return False
+    ost.append_jsonl(ost.HISTORY_PATH, [snap])
+    return True
+
+
+def prune_reports():
+    for pattern, keep in (("report-*.html", KEEP_REPORTS), ("brief-*.md", KEEP_BRIEFS)):
+        files = sorted(REPORT_DIR.glob(pattern), key=lambda p: p.stat().st_mtime)
+        for f in files[:-keep]:
+            try:
+                f.unlink()
+            except OSError:
+                pass
+
+
+def send_notification(d, copied=False):
+    """One-line summary for the desktop; the report itself has the detail."""
+    snap, base = d["snap"], d["session_start"] or d["prev"]
+    bits = [f"{snap['pp']:,.0f}pp"]
+    if base and base.get("pp") is not None:
+        gain = snap["pp"] - base["pp"]
+        if abs(gain) >= 0.1:
+            bits.append(f"{'+' if gain > 0 else ''}{gain:.1f}")
+    bits.append(f"#{snap['global_rank']:,}")
+    body = "  ".join(bits)
+    if d["session_scores"]:
+        accs = [(s.get("accuracy") or 0) * 100 for s in d["session_scores"]]
+        body += f"\n{len(d['session_scores'])} plays · {mean(accs):.1f}% avg acc"
+    if copied:
+        body += "\nbrief copied — paste into Claude"
+    try:
+        subprocess.run(["notify-send", "-a", "osu-report", "-i", "applications-games",
+                        "osu! session report", body], check=False, timeout=5)
+    except (FileNotFoundError, subprocess.SubprocessError):
+        pass
+
+
+def copy_to_clipboard(text):
+    """Put text on the system clipboard; Wayland first, X11 as a fallback."""
+    for cmd in (["wl-copy", "--type", "text/markdown"],
+                ["wl-copy"],
+                ["xclip", "-selection", "clipboard"]):
+        if not shutil.which(cmd[0]):
+            continue
+        try:
+            # wl-copy forks a daemon to serve the selection; it must not
+            # inherit our stdout or any pipe reading us never sees EOF
+            subprocess.run(cmd, input=text.encode(), check=True, timeout=10,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return True
+        except (subprocess.SubprocessError, OSError):
+            continue
+    return False
+
+
+def open_in_browser(path):
+    url = path.as_uri()
+    for cmd in (["firefox", "--new-window", url], ["xdg-open", url]):
+        if shutil.which(cmd[0]):
+            try:
+                subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                 start_new_session=True)
+                return True
+            except OSError:
+                continue
+    return False
+
+
+def main():
+    ap = argparse.ArgumentParser(description="osu! session report as an HTML dashboard")
+    ap.add_argument("--hours", type=int, default=6, help="session window (default 6)")
+    ap.add_argument("--top", type=int, default=10, help="all-time top N (default 10)")
+    ap.add_argument("--session-top", type=int, default=10, help="best N this session (default 10)")
+    ap.add_argument("--fast", action="store_true", help="cached UR only, no replay downloads")
+    ap.add_argument("--offline", action="store_true", help="render from local logs, no API")
+    ap.add_argument("--no-open", action="store_true", help="write the file only")
+    ap.add_argument("--notify", action="store_true", help="desktop notification as well")
+    ap.add_argument("--term", action="store_true",
+                    help="draw the dashboard in the terminal instead of a browser")
+    ap.add_argument("--sixel", action="store_true",
+                    help="draw the browser report inline as sixel graphics")
+    ap.add_argument("--brief", action="store_true",
+                    help="print the Markdown analysis digest to stdout")
+    ap.add_argument("--embed-font", action="store_true",
+                    help="inline the webfont (+150KB) so the file travels")
+    ap.add_argument("--copy", action="store_true",
+                    help="also put the Markdown digest on the clipboard")
+    ap.add_argument("--no-color", action="store_true", help="plain terminal output")
+    ap.add_argument("--no-save", action="store_true", help="don't append to history")
+    ap.add_argument("--out", help="output path (default ~/.local/share/osu-tracker/reports/)")
+    args = ap.parse_args()
+
+    if args.embed_font:
+        global EMBED_FONT
+        EMBED_FONT = True
+
+    data = gather(args)
+
+    if args.out:
+        path = Path(args.out).expanduser()
+        path.parent.mkdir(parents=True, exist_ok=True)
+    else:
+        REPORT_DIR.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        path = REPORT_DIR / f"report-{stamp}.html"
+
+    brief = build_brief(data)
+    if args.brief:
+        if args.copy:
+            if copy_to_clipboard(brief):
+                msg = f"{len(brief):,} chars copied — paste into Claude"
+                print(f"  {msg}")
+                if args.notify:
+                    subprocess.run(["notify-send", "-a", "osu-report",
+                                    "osu! brief copied", msg],
+                                   check=False, timeout=5)
+            else:
+                sys.exit("no clipboard tool found (install wl-clipboard)")
+        else:
+            print(brief)
+        return
+
+    path.write_text(render(data), encoding="utf-8")
+    # the digest rides along with every report, so it is always on hand
+    brief_path = path.with_name(path.stem.replace("report-", "brief-") + ".md")
+    brief_path.write_text(brief, encoding="utf-8")
+
+    if not args.out:
+        latest = REPORT_DIR / "latest.html"
+        latest.unlink(missing_ok=True)
+        latest.write_text(path.read_text(encoding="utf-8"), encoding="utf-8")
+        (REPORT_DIR / "latest-brief.md").write_text(brief, encoding="utf-8")
+        prune_reports()
+
+    copied = copy_to_clipboard(brief) if args.copy else False
+    if args.copy and not copied:
+        print("  clipboard copy failed (install wl-clipboard)", file=sys.stderr)
+
+    if not args.offline and not args.no_save:
+        save_snapshot(data["snap"], data["history"])
+
+    if args.notify and not args.offline:
+        send_notification(data, copied)
+
+    if args.term:
+        global USE_COLOR
+        USE_COLOR = sys.stdout.isatty() and not os.environ.get("NO_COLOR") \
+            and not args.no_color
+        print(render_terminal(data))
+        return
+    if args.sixel:
+        ok, err = show_sixel(path)
+        if not ok:
+            print(f"  {err}", file=sys.stderr)
+        return
+
+    print(path)
+    if not args.no_open and not open_in_browser(path):
+        print("  (no browser found — open the file above manually)", file=sys.stderr)
+
+
+if __name__ == "__main__":
+    main()
