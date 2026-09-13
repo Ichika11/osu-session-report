@@ -18,6 +18,18 @@ osu-report --sixel          # draw the report inline as sixel graphics (Linux)
 
 `osu-stats` is the older text-only summary. It still works if you prefer it.
 
+### Less common options
+
+| Flag | Does |
+|---|---|
+| `--top N` | how many all-time best plays to list (default 10) |
+| `--session-top N` | how many of the session's best to list (default 10) |
+| `--out PATH` | write the report somewhere specific |
+| `--no-open` | build the report but don't launch a browser |
+| `--notify` | send a desktop notification too (Linux) |
+| `--no-save` | don't append a snapshot to your history |
+| `--no-color` | plain terminal output, no ANSI colour |
+
 ---
 
 ## Keyboard shortcuts
