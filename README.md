@@ -42,7 +42,19 @@ row links to the map), a scatter of every top play over time, progress curves
 for pp / rank / accuracy, and rings for your hit and grade composition.
 
 **The same thing in your terminal** — `--term` draws it with truecolour and
-braille line charts. No browser, works over SSH.
+braille line charts. No browser, instant, works over SSH.
+
+```bash
+osu-report --term --hours 24
+```
+
+![Terminal report](docs/terminal.jpg)
+
+The charts are drawn in braille, which packs 2×4 dots per character cell —
+eight times the resolution of block sparklines, enough to read the shape of a
+climb rather than just its direction.
+
+![Terminal charts](docs/terminal-charts.jpg)
 
 **A Markdown digest for AI** — `--brief` writes a compact analysis file you can
 paste into Claude or ChatGPT and ask "where should I focus?". It reports
