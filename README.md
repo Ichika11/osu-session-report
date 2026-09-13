@@ -11,63 +11,91 @@ to osu!'s own API for your own scores.
 
 ---
 
-## What you get
+## Quick start
 
-Your profile banner sets the colour of the whole page, and the headline row
-shows what moved while you were playing.
+```bash
+osu-report            # dashboard in your browser
+osu-report --term     # the same thing in your terminal
+osu-report --brief    # a summary to paste into an AI
+```
 
-**Every play links to its map**, with unstable rate where a replay exists.
+Close osu! and the dashboard opens on its own. No flags needed.
+
+[Jump to install →](#install)
+
+---
+
+## Three ways to see it
+
+### 1. In your browser
+
+The page takes its colour from your profile banner.
+
+- **Headline row** — what moved while you played
+- **Every play links to its map**
+- **UR** shown wherever a replay exists
 
 ![Top plays](docs/top-plays.jpg)
 
-**Composition and history.** The rings break down the session's judgements and
-grades; the scatter plots all 100 of your top plays by when you set them against
-what they were worth. Hovering locks a crosshair to the nearest point and lifts
-its whole grade series.
+- **Rings** — the session's judgements and grades
+- **Scatter** — all 100 top plays, when you set them against what they were worth
+- **Hover** — a crosshair locks to the nearest point and lifts its grade series
 
 ![Composition and top plays over time](docs/composition.jpg)
 
-**Where you actually lose accuracy.** Progress curves, unstable rate over time
-coloured by star rating, and median UR per difficulty band.
+- **Progress curves** — pp, rank, accuracy
+- **UR over time** — coloured by star rating
+- **UR per difficulty band** — where your tapping falls apart
 
 ![Progress and consistency](docs/charts.jpg)
 
 ---
 
-## In detail
-
-**A full HTML dashboard** — your profile banner, headline stats with the change
-since the session began, the session's best plays and your all-time top 10 (each
-row links to the map), a scatter of every top play over time, progress curves
-for pp / rank / accuracy, and rings for your hit and grade composition.
-
-**The same thing in your terminal** — `--term` draws it with truecolour and
-braille line charts. No browser, instant, works over SSH.
+### 2. In your terminal
 
 ```bash
-osu-report --term --hours 24
+osu-report --term
 ```
+
+Instant. No browser. Works over SSH.
 
 ![Terminal report](docs/terminal.jpg)
 
-The charts are drawn in braille, which packs 2×4 dots per character cell —
-eight times the resolution of block sparklines, enough to read the shape of a
-climb rather than just its direction.
+Charts are drawn in braille — 2×4 dots per character cell. That's eight times
+the resolution of block sparklines, enough to read the *shape* of a climb.
 
 ![Terminal charts](docs/terminal-charts.jpg)
 
-**A Markdown digest for AI** — `--brief` writes a compact analysis file you can
-paste into Claude or ChatGPT and ask "where should I focus?". It reports
-performance banded by star rating, BPM, approach rate, OD and circle size, plus
-the caveats needed to read those numbers correctly.
+---
+
+### 3. As a summary for an AI
+
+```bash
+osu-report --brief --copy
+```
+
+Puts a Markdown report on your clipboard. Paste it into Claude or ChatGPT and
+ask where to focus.
+
+It breaks your performance down by:
+
+- star rating
+- BPM
+- approach rate
+- overall difficulty
+- circle size
+
+...plus the caveats needed to read those numbers correctly, so the AI doesn't
+draw the wrong conclusion.
 
 ---
 
 ## Install
 
-You need Python 3.9+ and osu! (lazer or stable). Both installers walk you
-through everything, including where to click on the osu! website to get your
-API credentials, and are safe to run again later.
+**You need:** Python 3.9+, and osu! (lazer or stable).
+
+The installer asks for your osu! API keys and tells you exactly where to click
+to get them. Safe to run again any time.
 
 ### Linux
 
@@ -79,9 +107,12 @@ cd osu-session-report
 
 ### Windows
 
-Install [Python](https://www.python.org/downloads/) first — **tick "Add
-python.exe to PATH"** in the installer, it's easy to miss and nothing works
-without it. Then, in PowerShell:
+**Step 1 — install [Python](https://www.python.org/downloads/).**
+
+> ⚠️ **Tick "Add python.exe to PATH"** in the Python installer.
+> It's a small checkbox on the first screen. Nothing works without it.
+
+**Step 2 — run the installer** in PowerShell:
 
 ```powershell
 git clone https://github.com/Ichika11/osu-session-report.git
@@ -89,10 +120,13 @@ cd osu-session-report
 powershell -ExecutionPolicy Bypass -File .\install.ps1
 ```
 
-No admin rights needed. `-ExecutionPolicy Bypass` applies to that one command
-only and doesn't change any system setting.
+**Step 3 — open a new terminal.**
 
-Open a **new** terminal afterwards, so it picks up the PATH change.
+The installer changes your PATH. Terminals that were already open keep the old
+one, so `osu-report` won't be found in them.
+
+No admin rights needed. `-ExecutionPolicy Bypass` applies to that one command
+only — it doesn't change any system setting.
 
 > **Windows support is newer and less exercised than Linux.** The Python side is
 > platform-aware and the installer follows Windows conventions, but if something
@@ -154,10 +188,13 @@ If you chose the Hyprland option during install:
 
 ## How the automatic report works
 
-The watcher (`osu-session-watch.sh` on Linux, `osu-session-watch.ps1` on
-Windows) polls every 20 seconds for an osu! process. When osu!
-exits it waits 60 seconds for the last score to submit, then builds the report.
-It takes a lock file, so a config reload can't start a second copy.
+A small watcher runs in the background:
+
+1. polls every 20 seconds for an osu! process
+2. waits 60 seconds after it exits, so the last score can submit
+3. builds the report and opens it
+
+It holds a lock, so it can't accidentally start twice.
 
 Change how the report appears by editing `MODE` at the top of
 `~/.local/bin/osu-session-watch.sh`, or by setting `OSU_REPORT_MODE`:
@@ -209,15 +246,18 @@ Total disk use settles around 3 MB.
 
 UR is the standard deviation of your hit timing error, ×10. Lower is steadier.
 
-**It will not match the number lazer shows you.** UR here is computed by
-circlecore using the *stable* algorithm; lazer judges slider heads differently
-and reads roughly 15–20% lower for the same play. The values are consistent with
-each other, so they're good for tracking trends — just don't compare them
-against the in-game figure.
+**It will not match the number lazer shows you.**
 
-UR is only available for scores that have a stored replay. osu! keeps **one
-replay per map per player** (your best), so a score that didn't beat your
-previous best shows `–`.
+- UR here uses the *stable* algorithm, via circlecore
+- lazer judges slider heads differently
+- lazer reads roughly **15–20% lower** for the same play
+
+These values are consistent with each other, so trends are trustworthy. Just
+don't compare them to the in-game figure.
+
+**Some rows show `–` instead of a number.** osu! keeps one replay per map per
+player — your best. A score that didn't beat your previous best has no replay,
+so there's nothing to measure.
 
 ---
 
