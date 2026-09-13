@@ -47,10 +47,20 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from statistics import mean, median
 
-STATS_PATH = Path.home() / ".local" / "bin" / "osu-stats"
-DATA_DIR = Path.home() / ".local" / "share" / "osu-tracker"
-REPORT_DIR = DATA_DIR / "reports"
-FONT_PATH = DATA_DIR / "fonts" / "rubik.woff2"
+def find_stats():
+    """
+    Locate osu-stats. Next to this script first, which is how it's laid out on
+    Windows and for a git checkout run in place, then the Linux bin directory.
+    """
+    here = Path(__file__).resolve().parent
+    for cand in (here / "osu-stats", here / "osu-stats.py",
+                 Path.home() / ".local" / "bin" / "osu-stats"):
+        if cand.exists():
+            return cand
+    return here / "osu-stats"
+
+
+STATS_PATH = find_stats()
 
 # HTML reports are bulky and disposable — the durable record is the jsonl logs
 # plus the Markdown digests, which are tiny.
@@ -82,6 +92,13 @@ def load_stats_module():
 
 
 ost = load_stats_module()
+
+# one definition of where things live, shared with osu-stats so both agree on
+# Windows as well as Linux
+DATA_DIR = ost.DATA_DIR
+REPORT_DIR = DATA_DIR / "reports"
+FONT_PATH = DATA_DIR / "fonts" / "rubik.woff2"
+IMG_CACHE = DATA_DIR / "images"
 
 
 # ------------------------------------------------------------------- theme --
@@ -1746,6 +1763,26 @@ ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 USE_COLOR = True
 
 
+def enable_windows_ansi():
+    """
+    Windows Terminal handles ANSI out of the box; the older conhost console
+    does not unless virtual-terminal processing is switched on for the handle.
+    No-op everywhere else, and harmless if it fails.
+    """
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+        k = ctypes.windll.kernel32
+        for handle in (-11, -12):                 # stdout, stderr
+            mode = ctypes.c_uint32()
+            h = k.GetStdHandle(handle)
+            if k.GetConsoleMode(h, ctypes.byref(mode)):
+                k.SetConsoleMode(h, mode.value | 0x0004)
+    except Exception:
+        pass
+
+
 def vlen(s):
     """Printed width, ignoring escapes and counting wide glyphs as two cells."""
     s = ANSI_RE.sub("", s)
@@ -2166,7 +2203,6 @@ def show_sixel(html_path):
 
 # --------------------------------------------------------------------- data --
 
-IMG_CACHE = DATA_DIR / "images"
 
 
 def image_size(raw):
@@ -2413,15 +2449,30 @@ def send_notification(d, copied=False):
         body += f"\n{len(d['session_scores'])} plays · {mean(accs):.1f}% avg acc"
     if copied:
         body += "\nbrief copied — paste into Claude"
+    if not shutil.which("notify-send"):
+        return                      # Windows and minimal desktops: stay quiet
     try:
         subprocess.run(["notify-send", "-a", "osu-report", "-i", "applications-games",
                         "osu! session report", body], check=False, timeout=5)
-    except (FileNotFoundError, subprocess.SubprocessError):
+    except (OSError, subprocess.SubprocessError):
         pass
 
 
 def copy_to_clipboard(text):
     """Put text on the system clipboard; Wayland first, X11 as a fallback."""
+    if os.name == "nt":
+        # clip.exe wants the console codepage; PowerShell handles UTF-8 cleanly
+        for cmd in (["powershell", "-NoProfile", "-Command",
+                     "$input | Set-Clipboard"], ["clip"]):
+            try:
+                subprocess.run(cmd, input=text.encode("utf-8"), check=True,
+                               timeout=15, stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL)
+                return True
+            except (subprocess.SubprocessError, OSError):
+                continue
+        return False
+
     for cmd in (["wl-copy", "--type", "text/markdown"],
                 ["wl-copy"],
                 ["xclip", "-selection", "clipboard"]):
@@ -2439,16 +2490,24 @@ def copy_to_clipboard(text):
 
 
 def open_in_browser(path):
+    """Open the report. A real browser window on Linux, the default handler
+    everywhere else — webbrowser knows what to do on Windows and macOS."""
     url = path.as_uri()
-    for cmd in (["firefox", "--new-window", url], ["xdg-open", url]):
-        if shutil.which(cmd[0]):
-            try:
-                subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                 start_new_session=True)
-                return True
-            except OSError:
-                continue
-    return False
+    if os.name != "nt":
+        for cmd in (["firefox", "--new-window", url], ["xdg-open", url]):
+            if shutil.which(cmd[0]):
+                try:
+                    subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
+                                     stderr=subprocess.DEVNULL,
+                                     start_new_session=True)
+                    return True
+                except OSError:
+                    continue
+    try:
+        import webbrowser
+        return webbrowser.open(url, new=1)
+    except Exception:
+        return False
 
 
 def main():
@@ -2472,7 +2531,7 @@ def main():
                     help="also put the Markdown digest on the clipboard")
     ap.add_argument("--no-color", action="store_true", help="plain terminal output")
     ap.add_argument("--no-save", action="store_true", help="don't append to history")
-    ap.add_argument("--out", help="output path (default ~/.local/share/osu-tracker/reports/)")
+    ap.add_argument("--out", help=f"output path (default {REPORT_DIR})")
     args = ap.parse_args()
 
     if args.embed_font:
@@ -2495,7 +2554,7 @@ def main():
             if copy_to_clipboard(brief):
                 msg = f"{len(brief):,} chars copied — paste into Claude"
                 print(f"  {msg}")
-                if args.notify:
+                if args.notify and shutil.which("notify-send"):
                     subprocess.run(["notify-send", "-a", "osu-report",
                                     "osu! brief copied", msg],
                                    check=False, timeout=5)
@@ -2529,6 +2588,7 @@ def main():
 
     if args.term:
         global USE_COLOR
+        enable_windows_ansi()
         USE_COLOR = sys.stdout.isatty() and not os.environ.get("NO_COLOR") \
             and not args.no_color
         print(render_terminal(data))

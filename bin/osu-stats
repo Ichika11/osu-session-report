@@ -28,6 +28,7 @@ Usage:
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -38,11 +39,21 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from statistics import mean, median
 
-CONFIG_DIR = Path.home() / ".config" / "osu-tracker"
+def _win_dir(var, *fallback):
+    return Path(os.environ.get(var) or Path.home().joinpath(*fallback))
+
+
+# Windows gets its own conventional locations; every other platform keeps the
+# XDG-style paths unchanged, so an existing install is untouched.
+if os.name == "nt":
+    CONFIG_DIR = _win_dir("APPDATA", "AppData", "Roaming") / "osu-tracker"
+    DATA_DIR = _win_dir("LOCALAPPDATA", "AppData", "Local") / "osu-tracker"
+else:
+    CONFIG_DIR = Path.home() / ".config" / "osu-tracker"
+    DATA_DIR = Path.home() / ".local" / "share" / "osu-tracker"
+
 CONFIG_PATH = CONFIG_DIR / "config.json"
 LEGACY_UR_CONFIG = CONFIG_DIR / "ur-config.json"
-
-DATA_DIR = Path.home() / ".local" / "share" / "osu-tracker"
 HISTORY_PATH = DATA_DIR / "history.jsonl"
 UR_LOG = DATA_DIR / "ur-log.jsonl"          # local .osr files
 SCORE_UR_LOG = DATA_DIR / "score-ur.jsonl"  # replays pulled from the API
@@ -51,10 +62,17 @@ SLIDER_CACHE = DATA_DIR / "beatmaps"
 TOKEN_URL = "https://osu.ppy.sh/oauth/token"
 API_BASE = "https://osu.ppy.sh/api/v2"
 
-DEFAULT_REPLAY_DIRS = [
-    Path.home() / ".local" / "share" / "osu" / "exports",
-    Path.home() / ".local" / "share" / "osu-wine" / "osu!" / "Replays",
-]
+if os.name == "nt":
+    DEFAULT_REPLAY_DIRS = [
+        _win_dir("APPDATA", "AppData", "Roaming") / "osu" / "exports",
+        _win_dir("LOCALAPPDATA", "AppData", "Local") / "osu!" / "Replays",
+        Path.home() / "AppData" / "Local" / "osu!" / "Replays",
+    ]
+else:
+    DEFAULT_REPLAY_DIRS = [
+        Path.home() / ".local" / "share" / "osu" / "exports",
+        Path.home() / ".local" / "share" / "osu-wine" / "osu!" / "Replays",
+    ]
 
 CONFIG_TEMPLATE = {
     "client_id": "",
@@ -631,10 +649,12 @@ def notify(snap, prev):
             parts.append(f"{'+' if d > 0 else ''}{d:,.0f}")
     if snap["global_rank"]:
         parts.append(f"#{snap['global_rank']:,}")
+    if not shutil.which("notify-send"):     # Windows / minimal desktops
+        return
     try:
         subprocess.run(["notify-send", "-a", "osu-stats", "osu! progress",
                         "  ".join(parts)], check=False, timeout=5)
-    except FileNotFoundError:
+    except (OSError, subprocess.SubprocessError):
         pass
 
 

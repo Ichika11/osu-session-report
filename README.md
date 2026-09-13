@@ -53,7 +53,11 @@ the caveats needed to read those numbers correctly.
 
 ## Install
 
-You need a Linux machine with Python 3.9+ and osu! (lazer or stable).
+You need Python 3.9+ and osu! (lazer or stable). Both installers walk you
+through everything, including where to click on the osu! website to get your
+API credentials, and are safe to run again later.
+
+### Linux
 
 ```bash
 git clone https://github.com/Ichika11/osu-session-report.git
@@ -61,8 +65,35 @@ cd osu-session-report
 ./install.sh
 ```
 
-The installer walks you through everything, including where to click on the osu!
-website to get your API credentials. It is safe to run again later.
+### Windows
+
+Install [Python](https://www.python.org/downloads/) first — **tick "Add
+python.exe to PATH"** in the installer, it's easy to miss and nothing works
+without it. Then, in PowerShell:
+
+```powershell
+git clone https://github.com/Ichika11/osu-session-report.git
+cd osu-session-report
+powershell -ExecutionPolicy Bypass -File .\install.ps1
+```
+
+No admin rights needed. `-ExecutionPolicy Bypass` applies to that one command
+only and doesn't change any system setting.
+
+Open a **new** terminal afterwards, so it picks up the PATH change.
+
+> **Windows support is newer and less exercised than Linux.** The Python side is
+> platform-aware and the installer follows Windows conventions, but if something
+> misbehaves please open an issue — include the output of `osu-report --brief`.
+
+| | Linux | Windows |
+|---|---|---|
+| Programs | `~/.local/bin/` | `%LOCALAPPDATA%\Programs\osu-session-report\` |
+| Config | `~/.config/osu-tracker/` | `%APPDATA%\osu-tracker\` |
+| Data & reports | `~/.local/share/osu-tracker/` | `%LOCALAPPDATA%\osu-tracker\` |
+| Autostart | Hyprland or systemd | Startup folder |
+| Desktop notification | yes | no — the report opening is the signal |
+| `--sixel` | yes, with chafa | not supported |
 
 ### Getting your credentials
 
@@ -111,7 +142,8 @@ If you chose the Hyprland option during install:
 
 ## How the automatic report works
 
-`osu-session-watch.sh` polls every 20 seconds for an osu! process. When osu!
+The watcher (`osu-session-watch.sh` on Linux, `osu-session-watch.ps1` on
+Windows) polls every 20 seconds for an osu! process. When osu!
 exits it waits 60 seconds for the last score to submit, then builds the report.
 It takes a lock file, so a config reload can't start a second copy.
 
@@ -124,12 +156,18 @@ Change how the report appears by editing `MODE` at the top of
 | `term` | the ANSI dashboard in a terminal window |
 | `sixel` | the HTML report drawn inline as sixel graphics |
 
+On Windows, set `OSU_REPORT_MODE` as a user environment variable, or edit
+`$Mode` at the top of `osu-session-watch.ps1`. `sixel` is Linux-only.
+
 **Restart the watcher after changing it.** Bash reads a script as it runs, so an
 edit doesn't reach the running process:
 
 ```bash
 pkill -f osu-session-watch.sh; setsid ~/.local/bin/osu-session-watch.sh &>/dev/null &
 ```
+
+On Windows, end the `powershell` process running the watcher in Task Manager
+and run the shortcut in your Startup folder again.
 
 ---
 
@@ -174,11 +212,22 @@ previous best shows `–`.
 ## Troubleshooting
 
 **`osu-report: command not found`**
-`~/.local/bin` isn't on your PATH. Add it:
+Linux — `~/.local/bin` isn't on your PATH:
 ```bash
 export PATH="$HOME/.local/bin:$PATH"    # in ~/.bashrc or ~/.zshrc
 fish_add_path ~/.local/bin              # fish
 ```
+Windows — open a **new** terminal; the installer edits PATH and existing
+terminals keep the old copy. If it still fails, Python probably wasn't added to
+PATH when you installed it: re-run the Python installer and choose Modify.
+
+**Windows: "running scripts is disabled on this system"**
+Run it the way the install line shows, with `-ExecutionPolicy Bypass`. That
+affects only that command.
+
+**Windows: the terminal report shows garbled characters**
+Use Windows Terminal rather than the old console window. The braille charts and
+box characters need a modern terminal and a font that carries them.
 
 **"API v2 auth failed" or replay downloads are skipped**
 Your OAuth callback URL doesn't match. It must be `http://localhost:8727/`
@@ -204,7 +253,10 @@ very fast the last play may still be missing. Run `osu-report` again.
 ## Uninstall
 
 ```bash
-./uninstall.sh
+./uninstall.sh                  # Linux
+```
+```powershell
+.\uninstall.ps1                 # Windows
 ```
 
 Removes the scripts and autostart entry. Your data and config are left alone
