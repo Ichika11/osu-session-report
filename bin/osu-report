@@ -252,6 +252,12 @@ GRADE_COLORS = {
 
 GRADE_LABELS = {"XH": "SS", "X": "SS", "SH": "S", "S": "S", "F": "F"}
 
+# SS and S are both gold in osu!; split them light/dark so a ring stays
+# readable without inventing a colour that means nothing
+GRADE_RING_COLORS = {"SS": "#ffd966", "S": "#eeaa00", "A": "#b3d944",
+                     "B": "#66ccff", "C": "#aa88ff", "D": "#ff6666",
+                     "F": "#8b7f92"}
+
 
 def grade_of(score):
     """Prefer the API's own grade; fall back to accuracy when absent."""
@@ -413,7 +419,7 @@ def svg_scatter_trend(rows, w=520, h=280):
     return "".join(parts)
 
 
-def svg_donut(slices, note="", size=210):
+def svg_donut(slices, note="", size=210, center=None):
     """
     Ring chart from stroke-dasharray segments — no arc-path maths, and each
     segment is a single element that can carry its own tooltip.
@@ -442,11 +448,15 @@ def svg_donut(slices, note="", size=210):
             f"stroke-dashoffset='{-acc * circ:.2f}' "
             f"transform='rotate(-90 {cx} {cy})' data-tip='{esc(tip)}'/>")
         acc += frac
-    biggest = max(slices, key=lambda s: s[1])
+    # the centre defaults to the dominant slice, but a caller can name a more
+    # useful headline — "30% F" is true and useless as a summary of a session
+    if center is None:
+        biggest = max(slices, key=lambda s: s[1])
+        center = (f"{biggest[1] / total * 100:.0f}%", biggest[0])
     out.append(f"<text x='{cx}' y='{cy - 2}' class='dn-big' text-anchor='middle'>"
-               f"{biggest[1] / total * 100:.0f}%</text>")
+               f"{esc(center[0])}</text>")
     out.append(f"<text x='{cx}' y='{cy + 16}' class='dn-sub' text-anchor='middle'>"
-               f"{esc(biggest[0])}</text>")
+               f"{esc(center[1])}</text>")
     out.append("</svg>")
 
     legend = "".join(
@@ -1198,26 +1208,52 @@ def render(d):
     A(play_table(d["best_scores"], d["ur_map"], ur_lo, ur_hi, "no top plays returned"))
     A("</section>")
 
-    # ---- hit + grade composition, as osu!track presents them
+    # ---- hit + grade composition; this session when there is one to show,
+    # otherwise the lifetime figures so the section is never empty
     hh = d.get("hits") or {}
-    if hh.get("count_300") or snap.get("s") or snap.get("a"):
+    hit_slices = grade_slices = None
+    if ss:
+        agg = {"300": 0, "100": 0, "50": 0, "miss": 0}
+        for s in ss:
+            st = s.get("statistics") or {}
+            agg["300"] += st.get("count_300") or 0
+            agg["100"] += st.get("count_100") or 0
+            agg["50"] += st.get("count_50") or 0
+            agg["miss"] += st.get("count_miss") or st.get("miss") or 0
+        hit_slices = [("300", agg["300"], "#66ccff"), ("100", agg["100"], "#b3d944"),
+                      ("50", agg["50"], "#ffcc22"), ("miss", agg["miss"], "#ff6666")]
+        tally = {}
+        for s in ss:
+            g = GRADE_LABELS.get(grade_of(s), grade_of(s)[0])
+            tally[g] = tally.get(g, 0) + 1
+        grade_slices = [(g, tally[g], GRADE_RING_COLORS.get(g, "#8b7f92"))
+                        for g in ("SS", "S", "A", "B", "C", "D", "F") if tally.get(g)]
+        scope_note = f"{len(ss)} scores in the last {d['hours']}h"
+        hit_note = "misses included"
+        grade_note = "every score in the window, passes and fails"
+        passed_n = sum(1 for s_ in ss if s_.get("passed"))
+        grade_center = (f"{passed_n / len(ss) * 100:.0f}%", "passed")
+    elif hh.get("count_300") or snap.get("s") or snap.get("a"):
         hit_slices = [("300", hh.get("count_300") or 0, "#66ccff"),
                       ("100", hh.get("count_100") or 0, "#b3d944"),
-                      ("50", hh.get("count_50") or 0, "#ffcc22")]
-        miss = hh.get("count_miss") or 0
-        # SS and S are both gold in osu!; split them light/dark so the ring
-        # stays readable without inventing a colour that means nothing
-        grade_slices = [("SS", snap.get("ss") or 0, "#ffd966"),
-                        ("S", snap.get("s") or 0, "#eeaa00"),
-                        ("A", snap.get("a") or 0, "#b3d944")]
-        A("<section id='composition'><h2>composition "
-          "<em>every ranked hit and grade on record</em></h2><div class='donuts'>")
+                      ("50", hh.get("count_50") or 0, "#ffcc22"),
+                      ("miss", hh.get("count_miss") or 0, "#ff6666")]
+        grade_slices = [(g, v, GRADE_RING_COLORS[g]) for g, v in
+                        (("SS", snap.get("ss") or 0), ("S", snap.get("s") or 0),
+                         ("A", snap.get("a") or 0)) if v]
+        scope_note = "lifetime totals — no scores in the window"
+        hit_note = "misses included"
+        grade_note = "SS and S include hidden-mod variants"
+        grade_center = None
+
+    if hit_slices:
+        A(f"<section id='composition'><h2>composition <em>{esc(scope_note)}</em></h2>"
+          f"<div class='donuts'>")
         A(f"<div class='panel'><h2 style='margin-bottom:14px'>hit accuracy"
-          f"<em>judgement split</em></h2>"
-          f"{svg_donut(hit_slices, f'{miss:,} misses, excluded from the ring')}</div>")
+          f"<em>judgement split</em></h2>{svg_donut(hit_slices, hit_note)}</div>")
         A(f"<div class='panel'><h2 style='margin-bottom:14px'>ranking ratio"
-          f"<em>ranked grades</em></h2>"
-          f"{svg_donut(grade_slices, 'SS and S include hidden-mod variants')}</div>")
+          f"<em>grades achieved</em></h2>"
+          f"{svg_donut(grade_slices, grade_note, center=grade_center)}</div>")
         A("</div></section>")
 
     # ---- every top play, plotted when it was set against what it was worth

@@ -7,9 +7,34 @@ your accuracy actually falls apart.
 Everything runs locally. The only thing that leaves your machine is a request
 to osu!'s own API for your own scores.
 
+![The dashboard](docs/dashboard.jpg)
+
 ---
 
 ## What you get
+
+Your profile banner sets the colour of the whole page, and the headline row
+shows what moved while you were playing.
+
+**Every play links to its map**, with unstable rate where a replay exists.
+
+![Top plays](docs/top-plays.jpg)
+
+**Composition and history.** The rings break down the session's judgements and
+grades; the scatter plots all 100 of your top plays by when you set them against
+what they were worth. Hovering locks a crosshair to the nearest point and lifts
+its whole grade series.
+
+![Composition and top plays over time](docs/composition.jpg)
+
+**Where you actually lose accuracy.** Progress curves, unstable rate over time
+coloured by star rating, and median UR per difficulty band.
+
+![Progress and consistency](docs/charts.jpg)
+
+---
+
+## In detail
 
 **A full HTML dashboard** — your profile banner, headline stats with the change
 since the session began, the session's best plays and your all-time top 10 (each
