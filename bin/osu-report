@@ -7,7 +7,7 @@ a full page: top plays, progress curves, and consistency analysis, then opens it
 
     osu-report                     full report for the last 6h, opens in a browser
     osu-report --term              draw it in the terminal instead — no browser
-    osu-report --sixel             the HTML report rasterised inline (needs sixel)
+    osu-report --image             the report drawn inline in the terminal
     osu-report --hours 3           narrow the session window
     osu-report --session-top 10    best N plays inside the window   (default 10)
     osu-report --top 10            all-time best N                  (default 10)
@@ -16,9 +16,10 @@ a full page: top plays, progress curves, and consistency analysis, then opens it
     osu-report --no-open           write the file, don't launch a browser
     osu-report --out PATH          explicit output path
 
---term renders with truecolour and braille line charts; it needs a terminal that
-supports 24-bit colour (foot, kitty, alacritty). --sixel needs one with sixel
-graphics (foot, xterm -ti vt340, wezterm) plus chafa and firefox.
+--term needs a terminal with 24-bit colour and a font carrying braille — kitty,
+alacritty, ghostty, foot and wezterm all qualify. --image additionally needs
+chafa and firefox; chafa picks whichever image protocol the terminal supports,
+falling back to block art where there is none.
 
 API access, credentials and UR computation are reused from osu-stats, so there
 is one implementation of each. Only the presentation lives here.
@@ -2169,10 +2170,15 @@ def render_terminal(d):
     return "\n".join(L)
 
 
-def show_sixel(html_path):
+def show_inline_image(html_path):
     """
-    Pixel-for-pixel the browser report, drawn inline as sixel graphics.
-    Needs a headless render first, so it costs a few seconds.
+    Pixel-for-pixel the browser report, drawn inline in the terminal.
+
+    chafa is left to pick its own output protocol: kitty and ghostty take the
+    kitty protocol, foot and wezterm take sixels, iTerm2 its own, and anything
+    else falls back to unicode block art. Forcing sixels would simply produce
+    garbage in half of those. Needs a headless render first, so it costs a few
+    seconds.
     """
     if not shutil.which("chafa"):
         return False, "chafa is not installed"
@@ -2195,8 +2201,8 @@ def show_sixel(html_path):
     if not png.exists():
         return False, "headless render produced no image"
     cols = shutil.get_terminal_size((100, 40)).columns - 2
-    subprocess.run(["chafa", "--format=sixel", f"--size={cols}x",
-                    "--animate=off", str(png)], check=False)
+    subprocess.run(["chafa", f"--size={cols}x", "--animate=off", str(png)],
+                   check=False)
     png.unlink(missing_ok=True)
     return True, None
 
@@ -2521,8 +2527,8 @@ def main():
     ap.add_argument("--notify", action="store_true", help="desktop notification as well")
     ap.add_argument("--term", action="store_true",
                     help="draw the dashboard in the terminal instead of a browser")
-    ap.add_argument("--sixel", action="store_true",
-                    help="draw the browser report inline as sixel graphics")
+    ap.add_argument("--image", "--sixel", dest="image", action="store_true",
+                    help="draw the report inline as an image (needs chafa)")
     ap.add_argument("--brief", action="store_true",
                     help="print the Markdown analysis digest to stdout")
     ap.add_argument("--embed-font", action="store_true",
@@ -2593,8 +2599,8 @@ def main():
             and not args.no_color
         print(render_terminal(data))
         return
-    if args.sixel:
-        ok, err = show_sixel(path)
+    if args.image:
+        ok, err = show_inline_image(path)
         if not ok:
             print(f"  {err}", file=sys.stderr)
         return

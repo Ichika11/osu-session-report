@@ -11,7 +11,7 @@ LOCK="$DATA/watch.lock"
 # or just change the default here.
 #   browser  full HTML dashboard in a new Firefox window
 #   term     ANSI dashboard in a foot window (fast, no browser)
-#   sixel    the HTML report rasterised inline in foot (slowest, pixel-exact)
+#   image    the report drawn inline in the terminal (slowest, pixel-exact)
 MODE="${OSU_REPORT_MODE:-term}"
 
 # osu! lazer's AppImage shows up as `osu!`; the other two cover stable/wine.
@@ -22,6 +22,18 @@ mkdir -p "$DATA"
 # One watcher at a time — a Hyprland reload re-runs exec-once.
 exec 9>"$LOCK"
 flock -n 9 || exit 0
+
+# Which terminal to open for term/image mode. $TERMINAL wins if you set it;
+# otherwise take the first one actually installed. All of these accept -e.
+pick_terminal() {
+    if [ -n "${TERMINAL:-}" ] && command -v "$TERMINAL" >/dev/null 2>&1; then
+        printf '%s' "$TERMINAL"; return
+    fi
+    for t in foot kitty ghostty wezterm alacritty konsole gnome-terminal \
+             xfce4-terminal tilix urxvt xterm; do
+        if command -v "$t" >/dev/null 2>&1; then printf '%s' "$t"; return; fi
+    done
+}
 
 log() {
     printf '%s  %s\n' "$(date '+%F %T')" "$*" >>"$LOG"
@@ -52,14 +64,20 @@ while true; do
     # --copy leaves the Markdown digest on the clipboard, ready to paste
     # straight into Claude without touching the file manager
     case "$MODE" in
-        term|sixel)
-            # explicitly bash, not the login fish, so `read -n1` behaves
-            foot -T "osu! session report" bash -c \
-                "'$REPORT' --hours $elapsed --$MODE --notify --copy; \
-                 printf '\n  press any key to close '; read -n1 -s" \
-                >>"$LOG" 2>&1 \
-                && log "report shown in foot ($MODE), brief copied" \
-                || log "foot report failed (exit $?)"
+        term|image)
+            term=$(pick_terminal)
+            if [ -z "$term" ]; then
+                log "no terminal emulator found; falling back to the browser"
+                "$REPORT" --hours "$elapsed" --notify --copy >>"$LOG" 2>&1
+            else
+                # explicitly bash, not the login shell, so `read -n1` behaves
+                "$term" -e bash -c \
+                    "'$REPORT' --hours $elapsed --$MODE --notify --copy; \
+                     printf '\n  press any key to close '; read -n1 -s" \
+                    >>"$LOG" 2>&1 \
+                    && log "report shown in $term ($MODE), brief copied" \
+                    || log "$term report failed (exit $?)"
+            fi
             ;;
         *)
             "$REPORT" --hours "$elapsed" --notify --copy >>"$LOG" 2>&1 \

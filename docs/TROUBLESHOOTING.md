@@ -4,12 +4,26 @@
 
 ## `osu-report: command not found`
 
-**Linux** — `~/.local/bin` isn't on your PATH:
+**Linux** — `~/.local/bin` isn't on your PATH.
+
+PATH comes from your **shell**, not your terminal. kitty, alacritty, ghostty,
+foot and the rest all just run whichever shell you've configured, so the fix is
+the same in all of them. Find out which one you're using:
 
 ```bash
-export PATH="$HOME/.local/bin:$PATH"    # in ~/.bashrc or ~/.zshrc
-fish_add_path ~/.local/bin              # fish
+echo $SHELL
 ```
+
+Then add the line for that shell:
+
+| Shell | Add to | Line |
+|---|---|---|
+| bash | `~/.bashrc` | `export PATH="$HOME/.local/bin:$PATH"` |
+| zsh | `~/.zshrc` | `export PATH="$HOME/.local/bin:$PATH"` |
+| fish | — | `fish_add_path ~/.local/bin` (run once) |
+| nushell | `env.nu` | `$env.PATH = ($env.PATH \| prepend $"($env.HOME)/.local/bin")` |
+
+Open a new terminal afterwards.
 
 **Windows** — open a **new** terminal. The installer edits PATH, and terminals
 that were already open keep the old copy.

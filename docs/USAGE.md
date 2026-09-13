@@ -13,7 +13,7 @@ osu-report --hours 3        # narrow the session window (default 6)
 osu-report --fast           # skip replay downloads, use what's cached
 osu-report --offline        # no network at all; render from local logs
 osu-report --embed-font     # inline the webfont so the file travels
-osu-report --sixel          # draw the report inline as sixel graphics (Linux)
+osu-report --image          # draw the report inline in the terminal
 ```
 
 `osu-stats` is the older text-only summary. It still works if you prefer it.
@@ -59,13 +59,25 @@ It holds a lock, so it can't accidentally start twice.
 |---|---|
 | `browser` | HTML dashboard in a new browser window (default) |
 | `term` | the ANSI dashboard in a terminal window |
-| `sixel` | the HTML report drawn inline as sixel graphics (Linux only) |
+| `image` | the report drawn inline in the terminal (Linux only) |
 
 **Linux** — edit `MODE` at the top of `~/.local/bin/osu-session-watch.sh`, or
 set `OSU_REPORT_MODE`.
 
 **Windows** — set `OSU_REPORT_MODE` as a user environment variable, or edit
 `$Mode` at the top of `osu-session-watch.ps1`.
+
+### Which terminal it opens
+
+For `term` and `image` mode the watcher opens a terminal window. It uses
+`$TERMINAL` if you've set it, otherwise the first of these that's installed:
+
+```
+foot  kitty  ghostty  wezterm  alacritty  konsole
+gnome-terminal  xfce4-terminal  tilix  urxvt  xterm
+```
+
+If none are found it falls back to opening the report in your browser.
 
 ### Restart the watcher after changing it
 
